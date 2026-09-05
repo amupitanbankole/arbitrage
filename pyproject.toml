@@ -1,0 +1,277 @@
+[project]
+name = "arbitrage-platform"
+version = "0.1.0"
+description = "Production-grade multi-user cryptocurrency arbitrage trading SaaS platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Arbitrage Platform Team" }]
+
+# The workspace root is a *virtual* project: it owns shared tooling
+# configuration (ruff / mypy / pytest) and aggregates the workspace members.
+# All runtime code lives in `packages/*` and `apps/*`.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # NOTE: `types-redis` is deliberately NOT a dependency. It was retired from
+    # typeshed because redis-py ships its own inline types (py.typed) from 4.2
+    # onward, and its final release (4.6.0.20241004) describes redis 4.6. With
+    # redis-py 8.x installed, those stubs take precedence over the real ones and
+    # silently mis-type the client — `Redis.aclose()`, added in 5.0.1, appears
+    # not to exist, which invites `type: ignore` comments that hide real errors.
+    "coverage[toml]>=7.6",
+    # Hermetic Redis for tests. Real Redis integration tests are env-gated and
+    # run in CI/docker-compose where a server actually exists (§142).
+    "fakeredis>=2.26",
+    # fakeredis only implements EVAL/EVALSHA when lupa is installed. The
+    # distributed lock (§65) uses Lua compare-and-delete, which is the correct
+    # implementation against real Redis; lupa lets the same code path be tested
+    # hermetically instead of being mocked away.
+    "lupa>=2.2",
+    # ASGI test client transport for FastAPI without running a real socket.
+    "httpx>=0.27",
+]
+# Tooling used by CI security jobs. Kept out of `dev` so a plain local
+# `uv sync` stays fast and does not require the audit toolchain.
+security = [
+    "pip-audit>=2.7",
+    "bandit[toml]>=1.7",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "packages/*",
+    "apps/api",
+    "apps/worker",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff — lint + format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["apps/*/src", "packages/*/src", "tests"]
+extend-exclude = [
+    ".venv",
+    "node_modules",
+    ".next",
+    # Migrations are immutable historical records: once a revision has been
+    # applied somewhere, reformatting it produces diff noise on a reviewed,
+    # deployed artefact. Globbed because they live under packages/persistence/.
+    "**/alembic/versions",
+]
+
+[tool.ruff.lint]
+# A deliberately strict, production-oriented rule set.
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "C4",     # flake8-comprehensions
+    "T20",    # flake8-print  (no print() in library/service code)
+    "SIM",    # flake8-simplify
+    "TID",    # flake8-tidy-imports
+    "TC",     # flake8-type-checking
+    "INT",    # flake8-gettext
+    "PTH",    # flake8-use-pathlib
+    "PYI",    # flake8-pyi
+    "Q",      # flake8-quotes
+    "RSE",    # flake8-raise
+    "RET",    # flake8-return
+    "SLF",    # flake8-self (no private member access across modules)
+    "ARG",    # flake8-unused-arguments
+    "PLE",    # pylint errors
+    "PLW",    # pylint warnings
+    "RUF",    # ruff-specific
+    "ASYNC",  # flake8-async
+    "S",      # flake8-bandit (security)
+    "DTZ",    # flake8-datetimez (timezone correctness — §75)
+    "EM",     # flake8-errmsg
+    "TRY",    # flake8-try-except-raise
+    "PERF",   # perflint
+    "PIE",    # flake8-pie
+    "ISC",    # flake8-implicit-str-concat
+    "BLE",    # flake8-blind-except (every broad except must be deliberate)
+]
+ignore = [
+    # Exception-message style. We raise through an explicit ErrorCode + message
+    # constant architecture (arb_core.errors), so these do not apply.
+    "EM101",
+    "EM102",
+    "EM103",
+    # FastAPI route handlers legitimately take many arguments.
+    "PLR0913",
+    # Long explanatory messages on domain errors are intentional.
+    "TRY003",
+    # `raise ... from` inside `except` blocks is used deliberately in adapters.
+    "B904",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency-injection idioms are not mutable-default bugs.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Security",
+]
+
+[tool.ruff.lint.flake8-builtins]
+# Pydantic models legitimately declare fields named `id`/`type` that mirror the
+# public API contract (§67). Shadowing a builtin as an *annotated* class
+# attribute is not a bug in that context.
+builtins-ignorelist = ["id", "type", "filter", "format"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the point of a test
+    "S105", "S106",  # committed test credentials are deliberate (tests/support)
+    "SLF001",  # tests assert on internals by design
+    "ARG001", "ARG002", "ARG005",  # pytest injects fixtures by name
+    "PLR2004",  # literal comparisons are clearer than constants in assertions
+]
+# SQLAlchemy resolves `Mapped[...]` annotations at mapper-configuration time by
+# looking the name up in the module namespace. A TYPE_CHECKING-only import is
+# absent at runtime, so moving `uuid`/`datetime` there breaks the mapping with a
+# NameError at first use rather than degrading quietly.
+"**/arb_persistence/models/**" = ["TC001", "TC002", "TC003"]
+# FastAPI resolves every annotation in these two modules at runtime through
+# get_type_hints, including the return types of the dependency callables, so
+# none of them may move into a TYPE_CHECKING block.
+"apps/api/src/arb_api/state.py" = ["TC001", "TC002", "TC003"]
+"apps/api/src/arb_api/api/dependencies.py" = ["TC001", "TC002", "TC003"]
+"**/alembic/versions/**" = ["E501", "I001", "N806"]
+"**/migrations/**" = ["E501"]
+
+[tool.ruff.lint.flake8-type-checking]
+# Annotations on these bases and inside these decorators are resolved at
+# *runtime*, so the names they use must stay importable at runtime. Moving them
+# into a TYPE_CHECKING block would break Pydantic validation, SQLAlchemy's
+# declarative mapping and FastAPI's dependency injection — a startup failure,
+# not a typing inconvenience.
+runtime-evaluated-base-classes = [
+    "pydantic.BaseModel",
+    "sqlalchemy.orm.DeclarativeBase",
+    "arb_core.db.base.Base",
+]
+runtime-evaluated-decorators = [
+    "fastapi.APIRouter.get",
+    "fastapi.APIRouter.post",
+    "fastapi.APIRouter.put",
+    "fastapi.APIRouter.patch",
+    "fastapi.APIRouter.delete",
+    "fastapi.get",
+    "fastapi.post",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["arb_core", "arb_api", "arb_worker"]
+force-wrap-aliases = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# mypy — static type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "packages/core/src:apps/api/src:apps/worker/src"
+files = ["packages", "apps/api/src", "apps/worker/src", "tests"]
+exclude = ["alembic/versions", "node_modules", "\\.venv", "\\.next"]
+
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+disallow_any_generics = true
+disallow_untyped_decorators = true
+extra_checks = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["fakeredis.*", "prometheus_client.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests", "packages/core/tests"]
+# Makes the repository root importable so tests can share helpers through
+# `tests.support.*` without turning every test directory into a package.
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "error",
+    # Third-party deprecations we cannot control yet.
+    "ignore::DeprecationWarning:fakeredis.*",
+]
+markers = [
+    "unit: fast, isolated tests with no external services",
+    "integration: tests requiring a database or Redis",
+    "postgres: tests that require a real PostgreSQL instance (env-gated)",
+    "redis_server: tests that require a real Redis server (env-gated)",
+    "security: authorization, secret-handling and abuse tests",
+    "slow: tests that take a noticeable amount of time",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+source = ["arb_core", "arb_api", "arb_worker"]
+omit = ["*/alembic/versions/*", "*/tests/*"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+# ---------------------------------------------------------------------------
+# bandit
+# ---------------------------------------------------------------------------
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "node_modules", "alembic/versions"]
+skips = ["B101"]

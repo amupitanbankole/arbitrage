@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# Secrets & environment  (§89, §133)
+# ---------------------------------------------------------------------------
+# NEVER commit real credentials. Only the documented *.example / template
+# files below are tracked; everything else that looks like an env file is
+# ignored so an accidental `.env` with production keys cannot be pushed.
+.env
+.env.*
+!.env.example
+!.env.development
+!.env.test
+!.env.production.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+infrastructure/docker/nginx/ssl/*.pem
+infrastructure/docker/nginx/ssl/*.crt
+infrastructure/docker/nginx/ssl/*.key
+!infrastructure/docker/nginx/ssl/.gitkeep
+
+# Backups may contain financial records — never commit them (§84).
+backups/
+*.dump
+*.sql.gz
+*.sql.bz2
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ---------------------------------------------------------------------------
+# Node / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.next-swc/
+.vercel/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Runtime data (docker volumes bind-mounted in development)
+# ---------------------------------------------------------------------------
+.pgdata/
+.redisdata/
+.grafana/
+.prometheus/
+docker-volumes/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Logs & temp
+# ---------------------------------------------------------------------------
+logs/
+*.log
+tmp/
+.tmp/
+tmpfiles/

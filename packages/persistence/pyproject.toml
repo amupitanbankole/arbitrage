@@ -1,0 +1,34 @@
+[project]
+name = "arb-persistence"
+version = "0.1.0"
+description = "ORM models, repositories and Alembic migrations shared by the API and every worker"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "arb-core",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "alembic>=1.13",
+    # Migrations run on the sync drivers (see alembic/env.py). Declared here
+    # rather than left to a transitive install, so `alembic upgrade head` cannot
+    # fail in a slim production image that only pulled in asyncpg.
+    "psycopg[binary]>=3.2",
+    # SQLite is development and the hermetic test-suite only; production
+    # configuration rejects it (arb_core.config.validate_deployed_environment).
+    "aiosqlite>=0.20",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arb_persistence"]
+
+[tool.uv.sources]
+arb-core = { workspace = true }
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.mypy]
+mypy_path = "src:../core/src"

@@ -1,0 +1,41 @@
+[project]
+name = "arb-core"
+version = "0.1.0"
+description = "Shared foundation: configuration, logging, identity, money, errors, database, Redis, health, metrics, worker runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # --- Validation & configuration ---
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    # --- Persistence (PostgreSQL is the source of truth — §64) ---
+    "sqlalchemy[asyncio]>=2.0.35",
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    "psycopg[binary]>=3.2",
+    "greenlet>=3.1",
+    # Portable test/development fallback driver. Never used for production
+    # financial data; arb_core.config rejects SQLite when ENVIRONMENT=production.
+    "aiosqlite>=0.20",
+    # --- Cache / pubsub / locks / queues ---
+    "redis>=5.0",
+    # --- Cryptography (credential envelope encryption — §12) ---
+    "cryptography>=43.0",
+    # --- Observability ---
+    "prometheus-client>=0.21",
+]
+
+[project.optional-dependencies]
+# Installed only where a worker process actually runs. Kept optional so the API
+# image does not carry worker-only dependencies.
+worker = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arb_core"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
