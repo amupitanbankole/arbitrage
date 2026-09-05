@@ -30,14 +30,14 @@ describes *verified behaviour*, not intent:
 | Lint | `uv run ruff check .` | All checks passed (strict rule set: `S`, `BLE`, `ASYNC`, `DTZ`, `TRY`, `TC`, …) |
 | Format | `uv run ruff format --check .` | 92 files already formatted |
 | Types | `uv run mypy packages apps tests` | Success: no issues in 89 files (`strict = true`, `warn_unreachable`, pydantic plugin) |
-| Tests | `uv run pytest` | **1049 passed, 2 skipped** |
+| Tests | `uv run pytest` | **1051 passed, 2 skipped** |
 
 The 2 skips are the PostgreSQL-backed database and migration suites. They are
 gated on `TEST_POSTGRES_URL` and **do run in CI**, which provides a real
 `postgres:16` service container. CI additionally fails the build if it sees their
 skip reason, so they cannot silently stop running.
 
-Test distribution: `tests/unit` 336 · `tests/integration` 664 (+2 gated) ·
+Test distribution: `tests/unit` 336 · `tests/integration` 666 (+2 gated) ·
 `tests/security` 49.
 
 ---
@@ -62,7 +62,7 @@ Test distribution: `tests/unit` 336 · `tests/integration` 664 (+2 gated) ·
 | Feature flags | `arb_persistence.*.feature_flags`, `arb_api.services.feature_flag_service` | DB rows authoritative, env bootstrap defaults only, rollout percentage, `allowed_user_ids` fast-path, `require_enabled()` raising `FEATURE_DISABLED`. |
 | Audit logging | `arb_persistence.*.audit`, `arb_api.services.audit_service` | Append-only table (UPDATE/DELETE blocked by trigger in the migration), unconditional redaction of payloads, `resource_id` stringified from UUID/int/str, four indexes matching the admin query patterns. |
 | Security headers | `arb_api.middleware.security_headers` | CSP `default-src 'none'`, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `Permissions-Policy`, `Cache-Control: no-store`, HSTS only when deployed. Applied to error envelopes directly as well, because an unhandled 500 is sent from outside the middleware stack. |
-| Request context & correlation | `arb_api.middleware.request_context` | `X-Request-ID` (uuid7) generated or propagated, contextvar-scoped, access log with route template and latency, metrics observation. |
+| Request context & correlation | `arb_api.middleware.request_context` | `X-Request-ID` (uuid7) generated or propagated, contextvar-scoped, access log with the full route template and latency, metrics observation. |
 | Money arithmetic | `arb_core.money` | `Decimal` only; `to_decimal()` rejects `float` by default and rejects `bool`; precision profiles for price/amount/money/rate/percent. |
 
 ### PARTIALLY IMPLEMENTED
@@ -211,3 +211,11 @@ Recorded because each one was a live failure mode, not a style complaint:
    import time.
 8. **`apps/worker` advertised an `arb-worker` console script whose module did not
    exist.** Installed but unrunnable.
+9. **Every nested v1 route was labelled with a truncated path.** FastAPI resolves
+   an *ancestor* router's prefix at match time, so `scope["route"].path` was
+   `/system/info` for a request to `/api/v1/system/info`. That value feeds both
+   the Prometheus `route` label and the access log, so the platform labelled its
+   own traffic with a path nobody can request — and once Phase 9 mounts
+   `/api/v1/admin`, `admin/users/{id}` and `users/{id}` would have collapsed into
+   a single series. Leaf routers now spell their complete prefix
+   (`arb_api.api.paths`), with two tests that fail against the old shape.

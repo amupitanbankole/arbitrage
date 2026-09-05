@@ -7,6 +7,11 @@ place an admin endpoint behind ordinary user authorization (§41, §102).
 
 Routers are included here rather than in the app factory so the URL tree is
 described in one reviewable place.
+
+This router carries **no prefix of its own**. Each included router spells its
+complete path instead — see :mod:`arb_api.api.paths`, which explains why a
+prefix declared here would be missing from ``scope["route"].path`` and therefore
+from every access log line and Prometheus ``route`` label.
 """
 
 from __future__ import annotations
@@ -15,13 +20,14 @@ from typing import Final
 
 from fastapi import APIRouter
 
+from arb_api.api.paths import API_V1_PREFIX
 from arb_api.api.v1 import system
 from arb_api.schemas.common import ApiIndex, ResourceGroup
 from arb_api.state import StateDep
 
 __all__ = ["api_v1_router"]
 
-api_v1_router = APIRouter(prefix="/api/v1")
+api_v1_router = APIRouter()
 
 api_v1_router.include_router(system.router)
 
@@ -54,7 +60,7 @@ _RESOURCE_GROUPS: Final[tuple[ResourceGroup, ...]] = (
 
 
 @api_v1_router.get(
-    "",
+    API_V1_PREFIX,
     response_model=ApiIndex,
     summary="API index",
     description=(

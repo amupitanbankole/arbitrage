@@ -123,7 +123,7 @@ a restart policy whether retrying could ever help.
 | `make check` | The CI gate: `ruff check`, `ruff format --check`, `mypy` strict, `pytest`. |
 | `make lint` / `make format` | Lint, and rewrite. |
 | `make typecheck` | mypy strict over `packages/`, `apps/`, `tests/`. |
-| `make test` | Full suite (1049 tests). |
+| `make test` | Full suite (1051 tests). |
 | `make migration m="…"` | Autogenerate an Alembic revision. |
 | `make migrate` | `alembic upgrade head`. |
 | `make doctor` | Toolchain versions and docker availability. |
@@ -145,7 +145,7 @@ runs; the production image and CI use 3.12, and CI runs the suite on both.
 ```
 tests/unit          336   isolated: money, clock, config, errors, events, logging,
                           pagination, redaction, identifiers
-tests/integration   664   database, migrations, health, system endpoints, Redis
+tests/integration   666   database, migrations, health, system endpoints, Redis
                           locks, feature flags, audit, worker runtime and CLI,
                           metrics endpoint (+2 PostgreSQL-gated)
 tests/security       49   endpoint invariants: error-envelope safety, universal

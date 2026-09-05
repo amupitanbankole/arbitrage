@@ -13,11 +13,15 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from arb_api.api.dependencies import SystemServiceDep
+from arb_api.api.paths import API_V1_PREFIX
 from arb_api.schemas.system import SystemInfo, WorkersResponse
 
 __all__ = ["router"]
 
-router = APIRouter(prefix="/system", tags=["system"])
+# The complete prefix, not a bare "/system": see arb_api.api.paths for why an
+# ancestor-declared prefix would make this route report a truncated path in
+# access logs and Prometheus labels.
+router = APIRouter(prefix=f"{API_V1_PREFIX}/system", tags=["system"])
 
 
 @router.get(

@@ -12,6 +12,7 @@ token required) lives in ``tests/security/test_endpoint_security.py``.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -148,6 +149,61 @@ class TestRegistryIsolation:
 
         assert 'route="/first"' in first_body
         assert 'route="/first"' not in second_body
+
+
+class TestRouteLabels:
+    async def test_a_nested_v1_route_reports_its_full_public_path(
+        self, metrics_client: AsyncClient
+    ) -> None:
+        """Regression guard for a truncated ``route`` label.
+
+        FastAPI resolves an *ancestor* router's prefix at match time, so a route
+        declared on a router nested inside ``APIRouter(prefix="/api/v1")`` kept
+        only its relative path: ``scope["route"].path`` was ``/system/info`` for
+        a request actually made to ``/api/v1/system/info``. Since that value
+        feeds both the Prometheus label and the access log, the platform was
+        labelling its traffic with a path nobody can request — and two routers
+        nested under different ancestors (``/api/v1/users/{id}`` and the Phase 9
+        ``/api/v1/admin/users/{id}``) would have collapsed into one series.
+
+        Leaf routers now spell their complete prefix; see
+        :mod:`arb_api.api.paths`.
+        """
+        await metrics_client.get("/api/v1/system/info")
+        await metrics_client.get("/api/v1/system/workers")
+        await metrics_client.get("/api/v1")
+
+        body = await _scrape(metrics_client)
+
+        for expected in ("/api/v1/system/info", "/api/v1/system/workers"):
+            assert f'route="{expected}"' in body, f"{expected} was not labelled with its full path"
+        # The truncated form must not exist at all, not merely alongside.
+        assert 'route="/system/info"' not in body
+        assert 'route="/system/workers"' not in body
+
+    async def test_labels_match_the_paths_a_client_actually_requests(
+        self, metrics_client: AsyncClient
+    ) -> None:
+        """Every labelled route must be a path in the OpenAPI document.
+
+        This is the property that was broken, expressed so it cannot silently
+        break again under a different router shape: if a label cannot be
+        requested, an operator cannot correlate a metric with an access log.
+        """
+        document = (await metrics_client.get("/openapi.json")).json()
+        documented = set(document["paths"])
+
+        for path in sorted(documented):
+            await metrics_client.get(path)
+
+        body = await _scrape(metrics_client)
+        labelled = set(re.findall(r'arb_api_requests_total\{[^}]*route="([^"]+)"', body))
+
+        assert labelled, "no request was recorded"
+        for label in labelled:
+            assert label in documented or label == "_unmatched", (
+                f"route label {label!r} is not a requestable path"
+            )
 
 
 class TestObservedRequests:
