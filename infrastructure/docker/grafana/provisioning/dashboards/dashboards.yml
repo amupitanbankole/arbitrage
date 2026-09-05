@@ -1,0 +1,20 @@
+# Grafana dashboard provisioning (§112).
+#
+# Dashboards are files in git, not rows in Grafana's database. A dashboard built
+# by clicking exists only on one host: it cannot be reviewed, cannot be reverted,
+# and is gone the moment the volume is recreated.
+apiVersion: 1
+
+providers:
+  - name: arbitrage-platform
+    orgId: 1
+    folder: Arbitrage
+    type: file
+    disableDeletion: false
+    # Reload when a mounted file changes, so a dashboard edit during development
+    # does not need a container restart.
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

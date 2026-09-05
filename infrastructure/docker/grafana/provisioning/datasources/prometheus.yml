@@ -1,0 +1,20 @@
+# Grafana datasource provisioning (§112).
+#
+# Provisioned from a file rather than configured through the UI so a rebuilt
+# container comes back with its datasource intact — a dashboard that silently
+# points at nothing after a redeploy is an observability gap that only shows up
+# during an incident.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: arb-prometheus
+    type: prometheus
+    access: proxy
+    # The compose service name, not localhost: Grafana runs in its own container.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

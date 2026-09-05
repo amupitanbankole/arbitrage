@@ -30,12 +30,6 @@ from uuid import UUID
 import fakeredis
 import pytest
 from httpx import ASGITransport, AsyncClient
-from tests.support.config import (
-    TEST_ENCRYPTION_KEY,
-    TEST_JWT_SECRET,
-    TEST_SESSION_SECRET,
-    production_kwargs,
-)
 
 # Importing the models package registers every mapped class on Base.metadata.
 # Without it, create_all() would silently create nothing.
@@ -48,6 +42,12 @@ from arb_core.db.session import Database
 from arb_core.events import InProcessEventBus
 from arb_core.metrics import Metrics
 from arb_core.redis.client import RedisClient
+from tests.support.config import (
+    TEST_ENCRYPTION_KEY,
+    TEST_JWT_SECRET,
+    TEST_SESSION_SECRET,
+    production_kwargs,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -58,8 +58,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Force the test environment before any settings are constructed."""
-    os.environ.setdefault("ENVIRONMENT", Environment.TEST.value)
+    """Force the test environment before any settings are constructed.
+
+    Assignment, not ``setdefault``: ``ENVIRONMENT`` selects which dotenv files
+    :func:`arb_core.config.resolve_env_files` loads *and* whether
+    ``validate_deployed_environment`` runs. A developer who happens to have
+    ``ENVIRONMENT=production`` exported would otherwise get a suite that
+    constructs production-validated settings, and every failure would look like
+    an application bug rather than what it is — an ambient variable. CI sets this
+    explicitly, so the hazard is local-only, which is exactly why nobody would
+    think to look for it there.
+    """
+    os.environ["ENVIRONMENT"] = Environment.TEST.value
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

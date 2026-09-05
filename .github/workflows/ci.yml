@@ -1,0 +1,329 @@
+# =============================================================================
+#  Continuous integration (§88, §142, §147)
+# =============================================================================
+#  The same gates `make check` runs locally, plus the two things a workstation
+#  cannot provide: a real PostgreSQL and a real Redis. Those are service
+#  containers, so the database and migration suites execute rather than skip —
+#  a migration that only ever ran against SQLite has not been tested (§44).
+#
+#  Every job fails the check. There is no "advisory" job, because an advisory
+#  gate is a gate nobody reads.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes the older run: CI minutes on a
+# financial platform are better spent on the commit that will actually merge.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Fail on any warning. The suite already treats warnings as errors; the
+  # interpreter should too, so a DeprecationWarning from a dependency upgrade is
+  # caught in CI rather than in production.
+  PYTHONWARNINGS: error
+  UV_FROZEN: "1"
+  # Pinned here and in .python-version so the image, CI and local development
+  # cannot silently diverge.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The lock file must describe exactly what the pyproject files ask for.
+  # ---------------------------------------------------------------------------
+  lock:
+    name: Dependency lock is in sync
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      # --locked refuses to update the lock; it only reports whether it would
+      # have to. Without this, a dependency added to a pyproject.toml can merge
+      # with a stale lock and the image build then fails.
+      - name: Verify uv.lock matches every pyproject.toml
+        run: uv lock --locked
+
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install
+        run: uv sync --all-packages --group dev
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      # Checked, not applied: a job that reformats and reports success hides the
+      # fact that someone committed unformatted code.
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Type check (mypy strict)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install
+        run: uv sync --all-packages --group dev
+
+      # mypy's own python_version stays at 3.11 in pyproject.toml, so this
+      # checks the *declared floor*: syntax or stubs that only work on a newer
+      # interpreter are rejected even while CI runs on 3.12.
+      - name: mypy
+        run: uv run mypy packages apps tests
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (py${{ matrix.python }}, postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the declared floor and the version local development runs on;
+        # 3.12 is what the production image uses. Both must pass, or the image
+        # is running something nobody tested.
+        python: ["3.11", "3.12"]
+        postgres: ["16"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_DB: arbitrage_test
+          POSTGRES_USER: arbitrage
+          POSTGRES_PASSWORD: ci_only_not_a_secret
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arbitrage -d arbitrage_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        # Stock Redis defaults already match the production policy: no AOF and
+        # `maxmemory-policy noeviction`. That matters for the lock suite (§65) —
+        # an allkeys-lru server would evict a held lock and the tests would pass
+        # while mutual exclusion was broken. Service `options` are docker create
+        # flags, so redis arguments cannot be appended here; they would have to
+        # come from a custom image, and the defaults are already correct.
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ENVIRONMENT: test
+      # Read by the `postgres` and `redis_server` markers; without them those
+      # suites skip rather than fail, which is how an untested migration merges.
+      TEST_POSTGRES_URL: postgresql+asyncpg://arbitrage:ci_only_not_a_secret@127.0.0.1:5432/arbitrage_test
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: uv sync --all-packages --group dev
+
+      - name: Full suite
+        run: uv run pytest --cov --cov-report=xml --cov-report=term-missing 2>&1 | tee pytest.log
+
+      # Guards the guard. Both suites are env-gated, so a service container that
+      # failed to become healthy would skip them and the job would still report
+      # success — an untested migration merging quietly. This asserts on the
+      # exact skip reasons conftest.py emits rather than on a skip count, so an
+      # unrelated legitimate skip cannot mask it.
+      - name: Confirm the service-backed suites executed
+        run: |
+          set -e
+          fail=0
+          if grep -q "requires a real PostgreSQL server" pytest.log; then
+            echo "::error::PostgreSQL-backed tests were skipped although TEST_POSTGRES_URL is set"
+            fail=1
+          fi
+          if grep -q "requires a real Redis server" pytest.log; then
+            echo "::error::real-Redis tests were skipped although TEST_REDIS_URL is set"
+            fail=1
+          fi
+          # And they must have been collected in the first place.
+          pg=$(uv run pytest -q -m postgres --collect-only --no-cov 2>/dev/null | tail -1)
+          rd=$(uv run pytest -q -m redis_server --collect-only --no-cov 2>/dev/null | tail -1)
+          echo "postgres-marked: $pg"
+          echo "redis_server-marked: $rd"
+          echo "$pg" | grep -qE "^[1-9][0-9]* test" || {
+            echo "::error::no postgres-marked tests were collected"; fail=1; }
+          exit $fail
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log-${{ matrix.python }}
+          path: pytest.log
+          retention-days: 7
+
+      - name: Upload coverage
+        if: matrix.python == env.PYTHON_VERSION
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # The image must build. Publishing is a separate, gated workflow (§88).
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Build platform image
+    runs-on: ubuntu-24.04
+    needs: [lock, lint, typecheck]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/docker/Dockerfile
+          push: false
+          load: true
+          tags: arbitrage-platform:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke-test the artefact rather than trusting the build: the console
+      # scripts must be on PATH and importable in the final, non-root image.
+      - name: Verify entrypoints resolve inside the image
+        run: |
+          docker run --rm --user 10001:10001 --entrypoint arb-worker \
+            arbitrage-platform:ci --list-roles
+          docker run --rm --user 10001:10001 --entrypoint python \
+            arbitrage-platform:ci -c "import arb_api.app, arb_persistence.models, arb_core.worker; print('imports ok')"
+
+      - name: Reject a root-owned or world-writable image
+        run: |
+          user=$(docker inspect --format '{{.Config.User}}' arbitrage-platform:ci)
+          echo "Config.User=$user"
+          [ "$user" = "arb" ] || { echo "::error::image does not run as the non-root 'arb' user"; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # Compose must at least parse and resolve. A full `up` needs a registry and
+  # several minutes; validating the file catches the class of error that stops a
+  # deployment cold.
+  # ---------------------------------------------------------------------------
+  compose:
+    name: Validate compose & nginx configuration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose config resolves
+        run: |
+          cp .env.example .env
+          # `config` performs full interpolation and would fail on a missing
+          # required variable or a malformed service definition.
+          docker compose -f infrastructure/docker/docker-compose.yml \
+            --env-file .env config --quiet
+
+      - name: nginx configuration is syntactically valid
+        run: |
+          docker run --rm \
+            -v "$PWD/infrastructure/docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$PWD/infrastructure/docker/nginx/conf.d:/etc/nginx/conf.d:ro" \
+            nginx:1.27-alpine nginx -t
+
+      - name: Prometheus configuration is syntactically valid
+        run: |
+          docker run --rm \
+            -v "$PWD/infrastructure/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+            --entrypoint promtool \
+            prom/prometheus:v2.54.1 check config /etc/prometheus/prometheus.yml
+
+      - name: Grafana provisioning and dashboard JSON parse
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          import yaml
+
+          failures = []
+          root = pathlib.Path("infrastructure/docker/grafana")
+          for path in sorted(root.rglob("*.yml")):
+              try:
+                  yaml.safe_load(path.read_text())
+              except Exception as exc:
+                  failures.append(f"{path}: {exc}")
+          for path in sorted(root.rglob("*.json")):
+              try:
+                  json.loads(path.read_text())
+              except Exception as exc:
+                  failures.append(f"{path}: {exc}")
+          if failures:
+              print("\n".join(failures))
+              sys.exit(1)
+          print("grafana provisioning + dashboards parse cleanly")
+          PY
+
+      - name: No secret is committed in infrastructure configuration
+        run: |
+          # A private key, a real password or a .env in the tree is a leak that
+          # survives deletion, because it survives in history.
+          if git grep -nIE -- \
+              'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' -- infrastructure .github; then
+            echo "::error::private key material found in tracked infrastructure files"
+            exit 1
+          fi
+          if git ls-files | grep -qE '(^|/)\.env$'; then
+            echo "::error::.env is tracked by git"
+            exit 1
+          fi
+          echo "no committed key material"

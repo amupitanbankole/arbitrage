@@ -1,0 +1,319 @@
+# =============================================================================
+#  Arbitrage platform — local / single-VPS stack (§86, §87, §88, §112)
+# =============================================================================
+#  Invoke through the Makefile from the repository root:
+#
+#      make up          # build, migrate, start everything
+#      make down        # stop and remove containers (volumes survive)
+#      make logs        # follow the platform services
+#
+#  or directly:
+#
+#      docker compose -f infrastructure/docker/docker-compose.yml --env-file .env up -d
+#
+#  Relative paths resolve against THIS file, so `../..` is the repository root.
+#
+#  Ordering is deliberate:
+#      postgres healthy -> migrate (runs once, must succeed) -> api + worker
+#  The application never creates its own schema (§44). If migrations fail the
+#  API does not start, which is the correct failure: serving traffic against a
+#  half-migrated database is how financial records get corrupted.
+# =============================================================================
+
+name: arbitrage-platform
+
+# Every Python service comes from one image; `command:` picks the entrypoint.
+x-platform-image: &platform-image
+  image: arbitrage-platform:${IMAGE_TAG:-latest}
+  build:
+    context: ../..
+    dockerfile: infrastructure/docker/Dockerfile
+
+# Hardening applied to every container. `no-new-privileges` stops a setuid
+# binary from escalating; dropping all capabilities leaves only what the
+# process actually needs, which for a Python HTTP server is nothing.
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — the source of truth for all financial data (§64)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    <<: [*hardening]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # Deterministic collation: financial reporting that sorts or groups text
+      # must not change behaviour when the base image locale changes.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Bound to loopback only. The database is reachable from other services on
+      # the internal network; publishing it on 0.0.0.0 would put a
+      # password-authenticated financial database one exposed port away from the
+      # internet (§88). Remove this mapping entirely on a hardened VPS.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Redis — cache, pub/sub, distributed locks (§64, §65). Never authoritative.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    <<: [*hardening]
+    restart: unless-stopped
+    # noeviction is a correctness setting, not a tuning one: the distributed
+    # lock (§65) is a Redis key, and an allkeys-lru policy would evict a held
+    # lock under memory pressure, silently destroying mutual exclusion and
+    # letting two processes trade the same opportunity. Failing a write is the
+    # safe outcome. Persistence is off because nothing in Redis is authoritative
+    # — a restart must produce a cold cache, not resurrect stale locks.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      # Reject a command that would let one environment's keys collide with
+      # another's; the application namespaces with REDIS_KEY_PREFIX instead.
+      - --databases
+      - "16"
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # Schema migration — runs once, gates everything else (§44, §141)
+  # ---------------------------------------------------------------------------
+  migrate:
+    <<: [*platform-image, *hardening]
+    command: ["alembic", "upgrade", "head"]
+    env_file: ../../.env
+    environment:
+      # Migrations use the sync driver (see packages/persistence/alembic/env.py).
+      # Inside the compose network the host is the service name. This overrides
+      # the `localhost` value a host-level .env carries, because `environment:`
+      # takes precedence over `env_file:`.
+      DATABASE_MIGRATION_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # A migration failure must not restart in a loop: each retry could apply
+    # part of a revision. Exit, stay exited, and make a human look at it.
+    restart: "no"
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # API — FastAPI behind nginx (§86)
+  # ---------------------------------------------------------------------------
+  api:
+    <<: [*platform-image, *hardening]
+    command: ["arb-api"]
+    env_file: ../../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_MIGRATION_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      # nginx sets X-Forwarded-For/Proto; without this the API would log the
+      # proxy's address as the client and derive the wrong scheme (§111).
+      TRUST_PROXY_HEADERS: "true"
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Read-only root filesystem: the API has no legitimate reason to write to
+    # disk, so a webshell or a path-traversal bug has nowhere to land (§88).
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    healthcheck:
+      # Liveness only. Readiness depends on PostgreSQL/Redis and is what nginx
+      # routes on; restarting the container because the database is briefly down
+      # would turn a dependency blip into an outage of the endpoint an operator
+      # needs to diagnose it (§111).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    networks:
+      - backend
+      - edge
+
+  # ---------------------------------------------------------------------------
+  # Worker — background roles with Redis heartbeats (§55, §140)
+  # ---------------------------------------------------------------------------
+  worker:
+    <<: [*platform-image, *hardening]
+    # Phase 1 runs the `foundation` role: it keeps the process alive so
+    # heartbeats, staleness detection and graceful shutdown are observable
+    # before any real job exists. Later phases add market-data, arbitrage,
+    # execution and notification roles here.
+    command: ["arb-worker", "foundation"]
+    env_file: ../../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_MIGRATION_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      WORKER_ROLES: foundation
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    # SIGTERM is what triggers the graceful shutdown: in-flight jobs finish, a
+    # final `status=stopped` heartbeat is written, then the process exits.
+    stop_grace_period: 45s
+    networks:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # nginx — the only publicly exposed listener (§87)
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    <<: [*hardening]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # TLS is opt-in and off by default: the mounted configuration has no 443
+      # listener, so publishing the port would advertise a service that cannot
+      # answer. To enable it, mount real certificates and
+      # infrastructure/docker/nginx/conf.d/tls.conf.example as
+      # /etc/nginx/conf.d/10-tls.conf, then uncomment both lines below.
+      # - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - edge
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — scrapes /metrics (§112)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    <<: [*hardening]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Bounded retention and size: an unbounded TSDB fills the VPS disk, and a
+      # full disk takes PostgreSQL down with it.
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=10GB
+    environment:
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      # Loopback only. Grafana is the intended way in; exposing Prometheus
+      # publicly publishes traffic shape and error rates (§124).
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+    networks:
+      - edge
+      - monitoring
+
+  # ---------------------------------------------------------------------------
+  # Grafana — dashboards (§112)
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    <<: [*hardening]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?GRAFANA_ADMIN_USER must be set}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      # No anonymous access, ever: dashboards show which exchanges are in use
+      # and how the platform is failing.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3001}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  # Database and cache live here and nowhere else. Nothing on `backend` is
+  # reachable from the host except through the loopback port mappings above.
+  backend:
+    driver: bridge
+  # Public edge: nginx and the services it fronts.
+  edge:
+    driver: bridge
+  monitoring:
+    driver: bridge

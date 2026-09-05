@@ -1,0 +1,40 @@
+# =============================================================================
+#  Prometheus scrape configuration (§54, §112)
+# =============================================================================
+#  ${VAR} placeholders are expanded by Prometheus from its own environment at
+#  startup; docker-compose passes METRICS_AUTH_TOKEN through. Nothing secret is
+#  written into this file, which is why it can be committed.
+# =============================================================================
+
+global:
+  # 15s matches WORKER_HEARTBEAT_INTERVAL_SECONDS, so a scrape and a heartbeat
+  # age out on comparable timescales and neither looks stale before the other.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    platform: arbitrage
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The API process. `/metrics` is refused at the nginx edge, so this scrape
+  # runs over the internal compose network only.
+  - job_name: arbitrage-api
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: api
+          phase: "1"
+    # Empty when METRICS_AUTH_TOKEN is unset, in which case the endpoint does
+    # not require a token and the header is simply not sent.
+    bearer_token: ${METRICS_AUTH_TOKEN}
+
+  # Workers do not serve HTTP; their liveness is a Redis heartbeat surfaced by
+  # the API's /api/v1/system/workers endpoint. Scraping the API therefore covers
+  # the fleet, and this comment exists so nobody adds a broken target for a
+  # port nothing listens on.

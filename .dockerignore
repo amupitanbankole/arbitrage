@@ -1,0 +1,60 @@
+# =============================================================================
+#  Docker build context exclusions
+# =============================================================================
+#  Everything listed here would otherwise be sent to the daemon on every build.
+#  Two of these matter for correctness, not just speed:
+#
+#    * `.env*` — a populated .env in the build context can be COPYied into an
+#      image layer by accident, and an image layer is effectively permanent.
+#      Configuration is injected at *runtime* by compose/secret manager (§90).
+#    * `.git` — carries the full history, including anything ever committed by
+#      mistake.
+# =============================================================================
+
+# --- Secrets and local configuration -----------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# --- Version control ---------------------------------------------------------
+.git
+.gitignore
+.github
+
+# --- Python artefacts --------------------------------------------------------
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+**/.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+tmpfiles
+
+# --- Node / frontend (built in its own image) --------------------------------
+node_modules
+**/node_modules
+.next
+**/.next
+apps/web
+
+# --- Local infrastructure state ----------------------------------------------
+infrastructure/docker/postgres/data
+infrastructure/docker/prometheus/data
+infrastructure/docker/grafana/data
+*.sqlite
+*.db
+
+# --- Editor / OS -------------------------------------------------------------
+.vscode
+.idea
+.DS_Store
