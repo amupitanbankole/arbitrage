@@ -1,8 +1,15 @@
 """Security response headers (§61, §87).
 
-Applied to every response, including error responses, because an error page that
-lacks ``X-Content-Type-Options`` is still a response an attacker can try to
-reinterpret.
+Applied to every response produced inside the middleware stack, including the
+error envelopes for ``AppError``, ``HTTPException`` and validation failures,
+because an error page that lacks ``X-Content-Type-Options`` is still a response
+an attacker can try to reinterpret.
+
+One case cannot be covered from here: Starlette installs ``ServerErrorMiddleware``
+above every user middleware, so the 500 for a genuinely unhandled exception is
+sent from outside this class. Those headers are attached by
+:mod:`arb_api.middleware.error_handlers` instead, and a security test asserts the
+union of the two paths.
 
 ``Strict-Transport-Security`` is emitted only when the deployment is actually
 behind TLS. Sending HSTS over plain HTTP is ignored by browsers, but emitting it

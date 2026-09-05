@@ -75,18 +75,22 @@ version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
     { name = "arb-core" },
+    { name = "arb-persistence" },
     { name = "fastapi" },
     { name = "pydantic" },
     { name = "python-multipart" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "arb-core", editable = "packages/core" },
+    { name = "arb-persistence", editable = "packages/persistence" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "python-multipart", specifier = ">=0.0.9" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.35" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 

@@ -5,10 +5,19 @@ description = "FastAPI application: versioned REST API, health, metrics, middlew
 requires-python = ">=3.11"
 dependencies = [
     "arb-core",
+    # The API reads and writes the ORM models directly (audit entries, feature
+    # flags, observability rows), so this is a hard runtime requirement — not a
+    # transitive one it could lose when a package is slimmed down.
+    "arb-persistence",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.9",
     "python-multipart>=0.0.9",
+    # Imported directly in repositories-facing service code (select/insert
+    # constructs, StatementError handling). Declared here rather than relied on
+    # through arb-persistence, so an import in arb_api never depends on another
+    # package's dependency list happening to expose it.
+    "sqlalchemy[asyncio]>=2.0.35",
 ]
 
 [project.scripts]
@@ -23,9 +32,10 @@ packages = ["src/arb_api"]
 
 [tool.uv.sources]
 arb-core = { workspace = true }
+arb-persistence = { workspace = true }
 
 [tool.ruff]
 extend = "../../pyproject.toml"
 
 [tool.mypy]
-mypy_path = "src:../../packages/core/src"
+mypy_path = "src:../../packages/core/src:../../packages/persistence/src"

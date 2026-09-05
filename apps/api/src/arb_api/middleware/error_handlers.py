@@ -8,6 +8,10 @@ No stack traces, no SQL, no driver messages, no file paths, no exchange
 responses. The detail an operator needs is in the structured log, correlated by
 ``request_id``.
 
+Every envelope carries the platform security headers itself rather than relying
+on :class:`~arb_api.middleware.security_headers.SecurityHeadersMiddleware` — see
+:func:`_platform_headers` for why an unhandled 500 would otherwise escape it.
+
 The request-validation handler deserves specific attention. Pydantic's
 ``errors()`` includes an ``input`` field containing **the value the client
 sent**. For a registration or credential-connection payload that is a password
@@ -26,6 +30,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from arb_api.middleware.request_context import REQUEST_ID_HEADER, request_id_from_scope
+from arb_api.middleware.security_headers import build_security_headers
 from arb_core.errors import AppError, ErrorCode, error_payload
 from arb_core.log import get_logger
 
@@ -52,6 +57,28 @@ def _request_id(request: Request) -> str | None:
     return request_id_from_scope(request.scope)
 
 
+def _platform_headers(request: Request) -> dict[str, str]:
+    """The security header set, for error responses generated outside the stack.
+
+    Starlette always installs ``ServerErrorMiddleware`` as the **outermost**
+    middleware, above everything in ``app.add_middleware``. An exception that
+    reaches it is turned into a response *there* and sent straight to the server,
+    so it never travels back through :class:`SecurityHeadersMiddleware` — its
+    ``send`` wrapper saw an exception propagate, not a ``http.response.start``.
+
+    Without this, the 500 for an unhandled exception would be the one response
+    the platform sends with no ``Content-Security-Policy``, no
+    ``X-Content-Type-Options`` and no ``Cache-Control: no-store`` — precisely the
+    response an attacker most wants to reinterpret or have a proxy cache (§61,
+    §87, §132). Handlers for ``AppError``, ``HTTPException`` and validation
+    errors run inside ``ExceptionMiddleware`` and *are* covered by the
+    middleware; they get the headers from here too, so no error path depends on
+    middleware ordering staying as it is today.
+    """
+    settings = getattr(request.app.state, "settings", None)
+    return build_security_headers(hsts=bool(getattr(settings, "is_deployed", False)))
+
+
 def _json_response(
     request: Request,
     exc: BaseException,
@@ -69,7 +96,10 @@ def _json_response(
         # opaque 500 at exactly the moment a client needs the real error.
         resolved_status = exc.http_status if isinstance(exc, AppError) else 500
 
-    response_headers = dict(headers or {})
+    # Platform defaults first; anything more specific overrides them, matching
+    # the setdefault semantics SecurityHeadersMiddleware uses for route handlers.
+    response_headers = _platform_headers(request)
+    response_headers.update(headers or {})
     if isinstance(exc, AppError) and exc.headers:
         response_headers.update(exc.headers)
     if request_id:

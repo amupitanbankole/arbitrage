@@ -69,9 +69,19 @@ def build_app(container: AppState) -> Any:
     return create_app(settings=container.settings, container=container)
 
 
-def build_client(app: Any) -> AsyncClient:
-    """An HTTP client calling the ASGI app in-process, with no open socket."""
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
+def build_client(app: Any, *, raise_app_exceptions: bool = True) -> AsyncClient:
+    """An HTTP client calling the ASGI app in-process, with no open socket.
+
+    ``raise_app_exceptions=False`` lets a test observe the response the platform
+    produces for an unhandled exception. Starlette's ``ServerErrorMiddleware``
+    sends the 500 envelope *and then re-raises*, so the server can log the
+    traceback; with the transport default of ``True`` that re-raise reaches the
+    test instead of the response, and the envelope goes unverified.
+    """
+    return AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions),
+        base_url="http://testserver",
+    )
 
 
 async def dispose(*resources: Any) -> None:
