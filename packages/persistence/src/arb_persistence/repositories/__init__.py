@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from arb_persistence.repositories.audit import AuditRepository
+from arb_persistence.repositories.auth import (
+    AuthTokenRepository,
+    MfaRecoveryCodeRepository,
+    SessionRepository,
+    UserRepository,
+)
 from arb_persistence.repositories.base import PaginatedResult, Repository
 from arb_persistence.repositories.feature_flags import FeatureFlagRepository
 from arb_persistence.repositories.observability import (
@@ -12,9 +18,13 @@ from arb_persistence.repositories.observability import (
 
 __all__ = [
     "AuditRepository",
+    "AuthTokenRepository",
     "FeatureFlagRepository",
+    "MfaRecoveryCodeRepository",
     "PaginatedResult",
     "Repository",
+    "SessionRepository",
     "SystemHealthRepository",
+    "UserRepository",
     "WorkerHeartbeatRepository",
 ]

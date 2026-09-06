@@ -5,20 +5,30 @@ which is what Alembic's ``target_metadata`` reads. A model that is not imported
 here is invisible to autogenerate and will silently never be migrated — so new
 models must always be added to the imports and to ``__all__``.
 
-Phase 1 scope
--------------
-Only platform-infrastructure tables exist so far. The domain tables listed in §10
-(authentication, exchanges, markets, strategies, arbitrage, orders, balances,
-P&L, risk, bots, notifications, SaaS) are added by the phase that needs them,
-each with its own migration (§9, §141). The current status of every table is
-tracked in ``docs/STATUS.md``.
+Phase scope
+-----------
+Phase 1 added the platform-infrastructure tables. Phase 2 adds authentication:
+``users``, ``user_sessions``, ``auth_tokens`` and ``mfa_recovery_codes``. The
+remaining domain tables listed in §10 (exchanges, markets, strategies, arbitrage,
+orders, balances, P&L, risk, bots, notifications, SaaS) are added by the phase that
+needs them, each with its own migration (§9, §141). The current status of every
+table is tracked in ``docs/STATUS.md``.
 """
 
 from __future__ import annotations
 
 from arb_core.db import Base
 from arb_persistence.models.audit import AuditLog
-from arb_persistence.models.enums import ActorType, AuditResult, WorkerStatus, enum_column
+from arb_persistence.models.auth import AuthToken, MfaRecoveryCode, User, UserSession
+from arb_persistence.models.enums import (
+    ActorType,
+    AuditResult,
+    AuthTokenPurpose,
+    SessionStatus,
+    UserStatus,
+    WorkerStatus,
+    enum_column,
+)
 from arb_persistence.models.feature_flags import FEATURE_FLAG_DEFAULTS, FeatureFlag
 from arb_persistence.models.observability import SystemHealthSnapshot, WorkerHeartbeat
 
@@ -27,9 +37,16 @@ __all__ = [
     "ActorType",
     "AuditLog",
     "AuditResult",
+    "AuthToken",
+    "AuthTokenPurpose",
     "Base",
     "FeatureFlag",
+    "MfaRecoveryCode",
+    "SessionStatus",
     "SystemHealthSnapshot",
+    "User",
+    "UserSession",
+    "UserStatus",
     "WorkerHeartbeat",
     "WorkerStatus",
     "enum_column",
