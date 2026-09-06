@@ -10,7 +10,9 @@ than discovering it one restart at a time.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
@@ -517,3 +519,61 @@ class TestSettingsSingleton:
 class TestEncryptionKeyUsability:
     def test_the_production_test_key_is_a_valid_fernet_key(self) -> None:
         Fernet(TEST_PRODUCTION_ENCRYPTION_KEY.encode())
+
+
+class TestEnvTemplateCoverage:
+    """``.env.example`` must describe every setting, and nothing that does not exist.
+
+    The template is the only thing an operator reads while standing up an environment,
+    and drift in either direction is silent. A new setting ships with a default nobody
+    knew they could change; a renamed one leaves an inert line in every deployment that
+    looks configured and is not. Comparing the two sets in a test turns both into a
+    failure at the moment the change is made.
+    """
+
+    _template = Path(__file__).resolve().parents[2] / ".env.example"
+
+    @classmethod
+    def _documented_keys(cls) -> set[str]:
+        # Assignment lines only. Commented-out examples (``# JWT_SECRET=...``) are
+        # documentation, not configuration, and must not count as documented keys.
+        return set(re.findall(r"^([A-Z0-9_]+)=", cls._template.read_text(), re.M))
+
+    @staticmethod
+    def _settings_keys() -> set[str]:
+        keys: set[str] = set()
+        for name, field in Settings.model_fields.items():
+            alias = field.validation_alias or field.alias or name
+            keys.add(alias.upper() if isinstance(alias, str) else name.upper())
+        return keys
+
+    def test_the_template_is_at_the_repository_root(self) -> None:
+        assert self._template.is_file(), f"expected the env template at {self._template}"
+
+    def test_every_setting_is_documented(self) -> None:
+        undocumented = sorted(self._settings_keys() - self._documented_keys())
+        assert undocumented == [], (
+            "these settings are not in .env.example, so an operator cannot know they "
+            f"exist or what they default to: {undocumented}"
+        )
+
+    def test_nothing_is_documented_that_does_not_exist(self) -> None:
+        unknown = sorted(self._documented_keys() - self._settings_keys())
+        assert unknown == [], (
+            "these .env.example keys match no setting, so they configure nothing and "
+            f"silently mislead whoever sets them: {unknown}"
+        )
+
+    def test_the_template_loads_without_configuration_errors(self) -> None:
+        """Copying the template is the documented first step, so it must work.
+
+        The environment reported here is whatever the process supplies, because that is
+        the precedence a real deployment relies on: an operator's ENVIRONMENT overrides
+        the file they copied. What the template must guarantee is that it parses and
+        that no cross-field invariant is violated by its own values.
+        """
+        settings = Settings(_env_file=self._template)
+        # The escape hatch stays off in the template: it exists for a developer who
+        # chooses it, not as a default everybody inherits by copying the file.
+        assert settings.allow_placeholder_secrets is False
+        assert settings.environment in set(Environment)
