@@ -23,6 +23,20 @@ dependencies = [
     "cryptography>=43.0",
     # --- Observability ---
     "prometheus-client>=0.21",
+    # --- Authentication (§59, §60) ---
+    # argon2id is the configured default password hash. argon2-cffi is used
+    # directly rather than through passlib, which has been unmaintained since
+    # 2020 and emits a runtime warning about exactly that on import.
+    "argon2-cffi>=23.1",
+    # The alternative scheme selectable via PASSWORD_HASH_SCHEME=bcrypt, for
+    # environments where a 64 MiB argon2 memory cost is not affordable.
+    "bcrypt>=4.2",
+    # JWT encode/decode. Not hand-rolled: signature verification, claim
+    # validation and algorithm-confusion resistance are precisely the parts
+    # where a bespoke implementation fails silently (§60).
+    "pyjwt>=2.9",
+    # RFC-compliant email address validation, required by pydantic's EmailStr.
+    "email-validator>=2.2",
 ]
 
 [project.optional-dependencies]

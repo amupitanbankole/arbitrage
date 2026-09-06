@@ -27,18 +27,31 @@ from enum import StrEnum
 from typing import Any, ClassVar, Final
 
 __all__ = [
+    "AccountDisabledError",
+    "AccountLockedError",
     "AppError",
     "AuthenticationError",
     "ConfigurationError",
     "ConflictError",
+    "CsrfError",
     "DependencyUnavailableError",
+    "EmailAlreadyRegisteredError",
+    "EmailNotVerifiedError",
     "ErrorCode",
     "FeatureDisabledError",
+    "InvalidCredentialsError",
+    "InvalidTokenError",
+    "MfaInvalidError",
+    "MfaRequiredError",
     "NotFoundError",
+    "PasswordPolicyError",
     "PermissionDeniedError",
     "RateLimitedError",
+    "RegistrationDisabledError",
     "RetryableError",
     "ServiceUnavailableError",
+    "SessionRevokedError",
+    "TokenExpiredError",
     "ValidationError",
     "error_payload",
     "http_status_for",
@@ -70,6 +83,29 @@ class ErrorCode(StrEnum):
     REDIS_UNAVAILABLE = "REDIS_UNAVAILABLE"
     EXCHANGE_UNAVAILABLE = "EXCHANGE_UNAVAILABLE"
     MARKET_DATA_STALE = "MARKET_DATA_STALE"
+
+    # --- Authentication & identity (§59, §60, §61) ---
+    #
+    # INVALID_CREDENTIALS deliberately covers "no such account" and "wrong
+    # password" alike. Distinguishing them turns the login endpoint into an
+    # account-enumeration oracle (§59).
+    INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+    ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
+    ACCOUNT_DISABLED = "ACCOUNT_DISABLED"
+    EMAIL_NOT_VERIFIED = "EMAIL_NOT_VERIFIED"
+    EMAIL_ALREADY_REGISTERED = "EMAIL_ALREADY_REGISTERED"
+    REGISTRATION_DISABLED = "REGISTRATION_DISABLED"
+    MFA_REQUIRED = "MFA_REQUIRED"
+    MFA_INVALID = "MFA_INVALID"
+    # S105 (hardcoded password) fires on these three because the *identifier*
+    # contains "token"/"password". They are error-code names whose value equals
+    # their name, not credentials, so the finding is suppressed on exactly these
+    # lines rather than file-wide.
+    TOKEN_INVALID = "TOKEN_INVALID"  # noqa: S105
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"  # noqa: S105
+    SESSION_REVOKED = "SESSION_REVOKED"
+    CSRF_FAILED = "CSRF_FAILED"
+    PASSWORD_POLICY_REJECTED = "PASSWORD_POLICY_REJECTED"  # noqa: S105
 
     # --- Trading safety (§22, §25, §26, §29, §62) ---
     ORDER_SUBMISSION_FAILED = "ORDER_SUBMISSION_FAILED"
@@ -104,6 +140,19 @@ _DEFAULT_STATUS: Final[dict[ErrorCode, int]] = {
     ErrorCode.REDIS_UNAVAILABLE: 503,
     ErrorCode.EXCHANGE_UNAVAILABLE: 502,
     ErrorCode.MARKET_DATA_STALE: 409,
+    ErrorCode.INVALID_CREDENTIALS: 401,
+    ErrorCode.ACCOUNT_LOCKED: 423,
+    ErrorCode.ACCOUNT_DISABLED: 403,
+    ErrorCode.EMAIL_NOT_VERIFIED: 403,
+    ErrorCode.EMAIL_ALREADY_REGISTERED: 409,
+    ErrorCode.REGISTRATION_DISABLED: 403,
+    ErrorCode.MFA_REQUIRED: 401,
+    ErrorCode.MFA_INVALID: 401,
+    ErrorCode.TOKEN_INVALID: 400,
+    ErrorCode.TOKEN_EXPIRED: 401,
+    ErrorCode.SESSION_REVOKED: 401,
+    ErrorCode.CSRF_FAILED: 403,
+    ErrorCode.PASSWORD_POLICY_REJECTED: 422,
     ErrorCode.ORDER_SUBMISSION_FAILED: 502,
     ErrorCode.ORDER_STATE_UNKNOWN: 409,
     ErrorCode.DUPLICATE_ORDER_PREVENTED: 409,
@@ -226,10 +275,26 @@ class ConflictError(AppError):
 
 
 class RateLimitedError(RetryableError):
-    """Too many requests; the client must back off (§61)."""
+    """Too many requests; the client must back off (§61).
+
+    ``retry_after_seconds`` is disclosed deliberately, as it is for
+    :class:`AccountLockedError`: a client that knows when to stop hammering is a
+    client that is not hammering, and RFC 9110 §10.2.3 asks for ``Retry-After`` on
+    a 429. It reveals when a window closes, which is already inferable by probing,
+    and nothing about the identity behind the limit.
+    """
 
     code: ClassVar[ErrorCode] = ErrorCode.RATE_LIMITED
     default_message: ClassVar[str] = "Too many requests. Please slow down."
+
+    def __init__(
+        self, message: str | None = None, *, retry_after_seconds: int | None = None, **kwargs: Any
+    ) -> None:
+        self.retry_after_seconds: Final[int | None] = retry_after_seconds
+        headers = dict(kwargs.pop("headers", None) or {})
+        if retry_after_seconds is not None:
+            headers.setdefault("Retry-After", str(retry_after_seconds))
+        super().__init__(message, headers=headers, **kwargs)
 
 
 class FeatureDisabledError(NonRetryableError):
@@ -237,6 +302,157 @@ class FeatureDisabledError(NonRetryableError):
 
     code: ClassVar[ErrorCode] = ErrorCode.FEATURE_DISABLED
     default_message: ClassVar[str] = "This feature is not enabled."
+
+
+class InvalidCredentialsError(NonRetryableError):
+    """Wrong email or password — or no such account (§59).
+
+    One code and one message for both cases. A distinct "no such user" response
+    would let an attacker enumerate registered accounts through the login
+    endpoint, which is the first step of a targeted credential attack.
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.INVALID_CREDENTIALS
+    default_message: ClassVar[str] = "The email address or password is incorrect."
+
+    def __init__(self, message: str | None = None, **kwargs: Any) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("WWW-Authenticate", "Bearer")
+        super().__init__(message, headers=headers, **kwargs)
+
+
+class AccountLockedError(NonRetryableError):
+    """Too many failed attempts; the account is temporarily locked (§59).
+
+    ``retry_after_seconds`` is safe to disclose: the client needs it to stop
+    hammering the endpoint, and it reveals nothing about the account beyond the
+    fact that somebody has been guessing at it.
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.ACCOUNT_LOCKED
+    default_message: ClassVar[str] = (
+        "This account is temporarily locked after too many failed sign-in attempts."
+    )
+
+    def __init__(
+        self, message: str | None = None, *, retry_after_seconds: int | None = None, **kwargs: Any
+    ) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        if retry_after_seconds is not None:
+            headers.setdefault("Retry-After", str(retry_after_seconds))
+        super().__init__(message, headers=headers, **kwargs)
+
+
+class AccountDisabledError(NonRetryableError):
+    """The account is suspended or closed and cannot authenticate (§44)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.ACCOUNT_DISABLED
+    default_message: ClassVar[str] = "This account is not able to sign in."
+
+
+class EmailNotVerifiedError(NonRetryableError):
+    """The account exists but its email address is not yet confirmed (§59)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.EMAIL_NOT_VERIFIED
+    default_message: ClassVar[str] = "Please verify your email address before signing in."
+
+
+class EmailAlreadyRegisteredError(NonRetryableError):
+    """That email address already has an account (§59).
+
+    Registration is the one endpoint that must disclose this, or a user who
+    mistypes an address they already registered gets no way to recover. The
+    enumeration risk is accepted deliberately and bounded by the authentication
+    rate limit on this route (§61, §76).
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.EMAIL_ALREADY_REGISTERED
+    default_message: ClassVar[str] = "An account with that email address already exists."
+
+
+class RegistrationDisabledError(NonRetryableError):
+    """Self-service sign-up is switched off by an operator (§59)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.REGISTRATION_DISABLED
+    default_message: ClassVar[str] = "Registration is currently disabled."
+
+
+class MfaRequiredError(AppError):
+    """The password was correct but a second factor is still owed (§59).
+
+    Carries a short-lived challenge token in ``details`` so the client can
+    complete the second step without resending the password. 401 rather than
+    200: the caller is *not* authenticated yet, and treating a half-completed
+    login as success is how MFA gets bypassed.
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.MFA_REQUIRED
+    default_message: ClassVar[str] = "Two-factor authentication is required."
+
+    def __init__(self, message: str | None = None, **kwargs: Any) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("WWW-Authenticate", "Bearer")
+        super().__init__(message, headers=headers, **kwargs)
+
+
+class MfaInvalidError(NonRetryableError):
+    """The supplied second factor did not verify (§59)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.MFA_INVALID
+    default_message: ClassVar[str] = "That authentication code is not valid."
+
+
+class InvalidTokenError(NonRetryableError):
+    """A one-time token is malformed, expired, already used or not theirs (§59).
+
+    One code for all four. Telling a caller which of them applied turns password
+    reset and email verification into a probe for valid tokens.
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.TOKEN_INVALID
+    default_message: ClassVar[str] = "That link is not valid or has expired."
+
+
+class TokenExpiredError(NonRetryableError):
+    """An access token's lifetime has elapsed; refresh or sign in again (§60)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.TOKEN_EXPIRED
+    default_message: ClassVar[str] = "Your session has expired. Please sign in again."
+
+    def __init__(self, message: str | None = None, **kwargs: Any) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("WWW-Authenticate", "Bearer")
+        super().__init__(message, headers=headers, **kwargs)
+
+
+class SessionRevokedError(NonRetryableError):
+    """The session backing this token was revoked or has ended (§60)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.SESSION_REVOKED
+    default_message: ClassVar[str] = "This session has ended. Please sign in again."
+
+    def __init__(self, message: str | None = None, **kwargs: Any) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("WWW-Authenticate", "Bearer")
+        super().__init__(message, headers=headers, **kwargs)
+
+
+class CsrfError(NonRetryableError):
+    """A cookie-authenticated request did not carry a matching CSRF token (§61)."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.CSRF_FAILED
+    default_message: ClassVar[str] = "The request could not be verified as same-origin."
+
+
+class PasswordPolicyError(ValidationError):
+    """The password does not meet the platform policy (§59).
+
+    ``details`` describes *which rule* failed. It never contains the submitted
+    password, in whole or in part (§71).
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.PASSWORD_POLICY_REJECTED
+    default_message: ClassVar[str] = "That password does not meet the requirements."
 
 
 class ConfigurationError(AppError):

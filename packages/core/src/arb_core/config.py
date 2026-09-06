@@ -26,11 +26,12 @@ surfaces the failure instead of silently trading with a broken configuration.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
@@ -41,6 +42,9 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from arb_core.errors import ConfigurationError
 from arb_core.log import get_logger
@@ -82,6 +86,11 @@ KNOWN_INSECURE_SECRETS: Final[frozenset[str]] = frozenset(
 )
 
 _MIN_SECRET_LENGTH: Final[int] = 64
+
+#: bcrypt's hard input limit. The algorithm hashes at most this many *bytes* and
+#: discards the remainder without error, so accepting a longer password would let
+#: two distinct passwords that share a prefix authenticate as one account.
+_BCRYPT_MAX_INPUT_BYTES: Final[int] = 72
 _PLACEHOLDER_PREFIXES: Final[tuple[str, ...]] = ("CHANGE_ME", "REPLACE_WITH", "REPLACE")
 
 
@@ -119,6 +128,12 @@ class PasswordHashScheme(StrEnum):
 
     ARGON2ID = "argon2id"
     BCRYPT = "bcrypt"
+
+
+def _describe_problems(environment: str, problems: Sequence[str]) -> str:
+    """Render collected configuration problems as one actionable message."""
+    detail = "; ".join(problems)
+    return f"refusing to start in {environment}: {len(problems)} configuration problem(s): {detail}"
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -260,13 +275,55 @@ class Settings(BaseSettings):
     session_secret: SecretStr = SecretStr(
         "dev_only_insecure_session_secret_do_not_use_anywhere_else_0123456789abc"
     )
+    #: ``iss`` / ``aud`` claims. Pinning both means a token minted by another
+    #: service that happens to share a secret cannot be replayed against this
+    #: API, and a token minted for a different audience is rejected (§60).
+    jwt_issuer: str = "arbitrage-platform"
+    jwt_audience: str = "arbitrage-platform-api"
+
+    #: Master switch for self-service sign-up. An operator can close registration
+    #: during a credential-stuffing or spam-signup incident without a redeploy.
+    registration_enabled: bool = True
+    #: When true a new account cannot authenticate until its email is verified.
+    email_verification_required: bool = True
+    email_verification_token_ttl_minutes: int = Field(default=1440, ge=5, le=20160)
+    password_reset_token_ttl_minutes: int = Field(default=60, ge=5, le=1440)
+
+    #: Brute-force defence that does **not** depend on Redis: the counter lives
+    #: in the ``users`` row, so it keeps working during a cache outage (§59).
+    login_max_failed_attempts: int = Field(default=5, ge=1, le=100)
+    login_lockout_minutes: int = Field(default=15, ge=1, le=1440)
+
+    #: Cookie and header names for the refresh-token / CSRF pair (§61). Names are
+    #: configuration rather than constants so that two environments can share a
+    #: domain without colliding.
+    refresh_cookie_name: str = "arb_refresh"
+    csrf_cookie_name: str = "arb_csrf"
+    csrf_header_name: str = "X-CSRF-Token"
+
+    # --- 6a. Multi-factor authentication (§59) --------------------------------
+    mfa_totp_issuer: str = "Arbitrage Platform"
+    mfa_totp_period_seconds: int = Field(default=30, ge=15, le=120)
+    mfa_totp_digits: int = Field(default=6, ge=6, le=8)
+    #: Accepted clock drift in *steps* either side of the current one. One step
+    #: (30 s) absorbs ordinary phone-vs-server skew; a larger window widens the
+    #: brute-force surface for a 6-digit code, so it is capped.
+    mfa_totp_drift_steps: int = Field(default=1, ge=0, le=4)
+    mfa_recovery_code_count: int = Field(default=10, ge=4, le=20)
+    #: Lifetime of the short-lived "password correct, MFA pending" challenge.
+    mfa_challenge_ttl_minutes: int = Field(default=5, ge=1, le=30)
 
     # --- 7. Password hashing (§59) -------------------------------------------
     password_hash_scheme: PasswordHashScheme = PasswordHashScheme.ARGON2ID
     argon2_time_cost: int = Field(default=3, ge=1, le=32)
     argon2_memory_cost_kib: int = Field(default=65536, ge=8192, le=2097152)
     argon2_parallelism: int = Field(default=4, ge=1, le=64)
+    bcrypt_rounds: int = Field(default=12, ge=10, le=15)
     password_min_length: int = Field(default=12, ge=8, le=256)
+    #: Upper bound exists for two reasons: it caps the CPU cost of a single
+    #: request (a 1 MiB password is a denial-of-service vector against the
+    #: hasher), and it keeps the platform honest about bcrypt's 72-byte limit.
+    password_max_length: int = Field(default=128, ge=16, le=1024)
 
     # --- 8. Credential encryption (§12) --------------------------------------
     encryption_key: SecretStr = SecretStr("db4D7xAh6Dn9sk-oUr0U2mQ_uGYIxZmxIKFF53hShKA=")
@@ -409,10 +466,28 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> Settings:
-        """Cross-field invariants that apply in every environment."""
+        """Cross-field invariants that apply in every environment (§145).
+
+        Every problem — cross-field, encryption-key and, in a deployed
+        environment, the production checklist — is collected and raised as one
+        error. Raising on the first failure would make an operator restart the
+        service once per misconfiguration, which is how a botched deployment
+        turns into an hour of downtime instead of a single edit (§145).
+        """
+        problems = self._collect_consistency_problems()
+        problems.extend(self._collect_encryption_key_problems())
+        if self.environment.is_deployed:
+            problems.extend(self._collect_deployed_problems())
+        if problems:
+            raise ConfigurationError(_describe_problems(self.environment.value, problems))
+        return self
+
+    def _collect_consistency_problems(self) -> list[str]:
+        """Cross-field invariants, as a list rather than a first-failure raise."""
+        problems: list[str] = []
+
         if self.cookie_samesite == "none" and not self.cookie_secure:
-            msg = "COOKIE_SAMESITE=none requires COOKIE_SECURE=true"
-            raise ConfigurationError(msg)
+            problems.append("COOKIE_SAMESITE=none requires COOKIE_SECURE=true")
 
         origins = self.cors_origin_list
         # A wildcard origin is rejected unconditionally, not only when
@@ -422,48 +497,74 @@ class Settings(BaseSettings):
         # a third-party page, a leaked browser extension). Listing explicit
         # origins costs nothing and removes the whole class of problem (§61).
         if "*" in origins:
-            msg = (
+            problems.append(
                 "CORS_ORIGINS may not be '*'. List the explicit browser origins "
                 "that may call this API."
             )
-            raise ConfigurationError(msg)
         for origin in origins:
             parsed = urlparse(origin)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                msg = f"CORS_ORIGINS entry {origin!r} is not a valid http(s) origin"
-                raise ConfigurationError(msg)
+                problems.append(f"CORS_ORIGINS entry {origin!r} is not a valid http(s) origin")
 
         if self.worker_stale_after_seconds <= self.worker_heartbeat_interval_seconds:
-            msg = (
+            problems.append(
                 "WORKER_STALE_AFTER_SECONDS must exceed WORKER_HEARTBEAT_INTERVAL_SECONDS "
                 "or every worker will be reported missing"
             )
-            raise ConfigurationError(msg)
 
-        # Encryption key must be usable before anything tries to store a secret.
-        self._validate_encryption_key()
+        # bcrypt hashes only the first 72 *bytes* of its input and discards the
+        # rest without error. Accepting a longer PASSWORD_MAX_LENGTH alongside
+        # PASSWORD_HASH_SCHEME=bcrypt would therefore let two different passwords
+        # that share a 72-byte prefix authenticate as the same account — a
+        # silent, exploitable truncation. Refuse the combination outright rather
+        # than clamp it at runtime behind the operator's back.
+        if (
+            self.password_hash_scheme is PasswordHashScheme.BCRYPT
+            and self.password_max_length > _BCRYPT_MAX_INPUT_BYTES
+        ):
+            problems.append(
+                f"PASSWORD_HASH_SCHEME=bcrypt requires PASSWORD_MAX_LENGTH <= "
+                f"{_BCRYPT_MAX_INPUT_BYTES}: bcrypt silently discards everything past that "
+                f"byte, so longer passwords would collide. Use argon2id, or lower "
+                f"PASSWORD_MAX_LENGTH."
+            )
 
-        if self.environment.is_deployed:
-            self.validate_deployed_environment()
-        return self
+        # Distinct purposes need distinct keys. Sharing one secret between token
+        # signing and CSRF/session material means a leak or a forgery primitive
+        # in one scheme immediately undermines the other (§60, §61).
+        if self.jwt_secret.get_secret_value() == self.session_secret.get_secret_value():
+            problems.append("JWT_SECRET and SESSION_SECRET must be different values")
 
-    def _validate_encryption_key(self) -> None:
-        """Ensure ``ENCRYPTION_KEY`` is a usable Fernet key (§12)."""
+        # An access token that outlives its session cannot be revoked: the
+        # session row would be gone or expired while the token still validates.
+        if self.access_token_ttl >= self.session_absolute_ttl:
+            problems.append(
+                "ACCESS_TOKEN_TTL_MINUTES must be shorter than the effective session "
+                "lifetime (the stricter of SESSION_TTL_HOURS and REFRESH_TOKEN_TTL_DAYS), "
+                "otherwise revoking a session has no effect on tokens already issued"
+            )
+
+        return problems
+
+    def _collect_encryption_key_problems(self) -> list[str]:
+        """Ensure ``ENCRYPTION_KEY`` is usable before anything stores a secret (§12)."""
         key = self.encryption_key.get_secret_value()
         if key.startswith(_PLACEHOLDER_PREFIXES):
-            if not (self.allow_placeholder_secrets and not self.environment.is_deployed):
-                msg = "ENCRYPTION_KEY is still a template placeholder"
-                raise ConfigurationError(msg)
-            return
+            if self.allow_placeholder_secrets and not self.environment.is_deployed:
+                return []
+            return ["ENCRYPTION_KEY is still a template placeholder"]
         try:
             Fernet(key.encode())
-        except (ValueError, TypeError) as exc:
-            msg = (
-                "ENCRYPTION_KEY must be a url-safe base64-encoded 32-byte key. "
-                "Generate one with: python -c "
-                '"from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"'
-            )
-            raise ConfigurationError(msg) from exc
+        except (ValueError, TypeError):
+            return [
+                (
+                    "ENCRYPTION_KEY must be a url-safe base64-encoded 32-byte key. "
+                    "Generate one with: python -c "
+                    '"from cryptography.fernet import Fernet;'
+                    'print(Fernet.generate_key().decode())"'
+                )
+            ]
+        return []
 
     def validate_deployed_environment(self) -> None:
         """Fail closed when a staging/production configuration is unsafe (§145).
@@ -471,7 +572,17 @@ class Settings(BaseSettings):
         Raises :class:`~arb_core.errors.ConfigurationError` listing every problem
         found, so an operator fixes the whole configuration in one pass instead
         of discovering issues one restart at a time.
+
+        The constructor already performs this check for deployed environments;
+        the method stays public so an operator or a test can re-run it against a
+        configuration built elsewhere.
         """
+        problems = self._collect_deployed_problems()
+        if problems:
+            raise ConfigurationError(_describe_problems(self.environment.value, problems))
+
+    def _collect_deployed_problems(self) -> list[str]:
+        """The staging/production safety checklist, as a list of problems."""
         problems: list[str] = []
 
         if self.debug:
@@ -530,13 +641,7 @@ class Settings(BaseSettings):
         if self.live_trading_enabled and not self.feature_flag_live_trading:
             problems.append("LIVE_TRADING_ENABLED is true but FEATURE_FLAG_LIVE_TRADING is false")
 
-        if problems:
-            detail = "; ".join(problems)
-            msg = (
-                f"refusing to start in {self.environment.value}: "
-                f"{len(problems)} configuration problem(s): {detail}"
-            )
-            raise ConfigurationError(msg)
+        return problems
 
     # ------------------------------------------------------------------
     # Derived values
@@ -565,6 +670,63 @@ class Settings(BaseSettings):
     def worker_role_list(self) -> list[str]:
         """Parsed ``WORKER_ROLES`` list."""
         return _split_csv(self.worker_roles)
+
+    # --- Authentication lifetimes (§59, §60) ---------------------------------
+    #
+    # Expressed as ``timedelta`` rather than raw integers so that no call site
+    # has to remember whether a value is minutes, hours or days — the unit
+    # confusion that produces a 15-day access token instead of a 15-minute one.
+    @property
+    def access_token_ttl(self) -> timedelta:
+        """Lifetime of a JWT access token."""
+        return timedelta(minutes=self.access_token_ttl_minutes)
+
+    @property
+    def refresh_token_ttl(self) -> timedelta:
+        """Configured maximum lifetime of a refresh credential."""
+        return timedelta(days=self.refresh_token_ttl_days)
+
+    @property
+    def session_absolute_ttl(self) -> timedelta:
+        """Absolute lifetime of a server-side session.
+
+        The **stricter** of ``SESSION_TTL_HOURS`` and ``REFRESH_TOKEN_TTL_DAYS``.
+        Both are operator-facing knobs describing the same credential from
+        different angles — how long a session may live, and how long its refresh
+        token may live — so taking the minimum means neither can silently extend
+        the other. With the defaults a session ends after 12 hours regardless of
+        the 30-day refresh setting; an operator who wants 30-day sessions raises
+        ``SESSION_TTL_HOURS`` (its maximum, 720, is exactly 30 days).
+        """
+        return min(
+            timedelta(hours=self.session_ttl_hours),
+            timedelta(days=self.refresh_token_ttl_days),
+        )
+
+    @property
+    def session_idle_ttl(self) -> timedelta:
+        """Inactivity period after which a session expires."""
+        return timedelta(minutes=self.session_idle_timeout_minutes)
+
+    @property
+    def login_lockout_duration(self) -> timedelta:
+        """How long an account stays locked after too many failed logins."""
+        return timedelta(minutes=self.login_lockout_minutes)
+
+    @property
+    def email_verification_token_ttl(self) -> timedelta:
+        """Lifetime of a one-time email verification token."""
+        return timedelta(minutes=self.email_verification_token_ttl_minutes)
+
+    @property
+    def password_reset_token_ttl(self) -> timedelta:
+        """Lifetime of a one-time password reset token."""
+        return timedelta(minutes=self.password_reset_token_ttl_minutes)
+
+    @property
+    def mfa_challenge_ttl(self) -> timedelta:
+        """Lifetime of the "password correct, MFA pending" challenge token."""
+        return timedelta(minutes=self.mfa_challenge_ttl_minutes)
 
     @property
     def database_url_safe(self) -> str:

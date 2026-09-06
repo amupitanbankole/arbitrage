@@ -1,4 +1,4 @@
-"""Identifier generation.
+"""Identifier generation and normalisation.
 
 The platform uses **UUIDv7** (RFC 9562) for primary keys. Compared with random
 UUIDv4 this matters for a trading system: the leading 48 bits are a millisecond
@@ -10,6 +10,11 @@ splits (§82).
 IDs are exposed externally in their canonical string form, optionally with a
 short type prefix (``ord_``, ``trd_``, ``bot_``) so that support staff and log
 readers can tell at a glance what kind of object an identifier refers to.
+
+One identifier is not generated but typed: the login email address. It lives here
+because the rule that matters is the same kind of rule — every part of the platform
+must agree on the canonical form of an identifier, or lookups disagree. See
+:func:`normalize_email`.
 """
 
 from __future__ import annotations
@@ -21,7 +26,21 @@ from dataclasses import dataclass
 from typing import Final
 from uuid import UUID
 
-__all__ = ["new_id", "new_id_str", "parse_id", "prefixed_id", "uuid7"]
+__all__ = [
+    "EMAIL_MAX_LENGTH",
+    "new_id",
+    "new_id_str",
+    "normalize_email",
+    "parse_id",
+    "prefixed_id",
+    "uuid7",
+]
+
+#: Longest address accepted. RFC 5321 allows 254 characters in a reverse-path
+#: (320 only for the quoted-local-part form nobody implements); 254 is what every
+#: real mail server will actually deliver to, and it is the width of the
+#: ``users.email`` column, so validation and storage cannot disagree.
+EMAIL_MAX_LENGTH: Final[int] = 254
 
 # UUIDv7 field layout (RFC 9562 §5.7):
 #   48 bits unix_ts_ms | 4 bits version | 12 bits rand_a | 2 bits variant | 62 bits rand_b
@@ -128,3 +147,53 @@ def prefixed_id(prefix: str) -> str:
         msg = "prefix must be a short ASCII alphanumeric tag, e.g. 'ord', 'trd', 'bot'"
         raise ValueError(msg)
     return f"{prefix.lower()}_{uuid7()}"
+
+
+def normalize_email(value: str) -> str:
+    """Return the canonical form of a login email address.
+
+    The email address is the one identifier on this platform that a human types,
+    so it is the one that can arrive in several spellings. Every path that stores
+    or looks up an account must agree on the canonical form, or the same person
+    becomes two accounts — and two accounts with one password-reset flow is a
+    takeover, not a duplicate.
+
+    Applied: surrounding whitespace is stripped and the address is lowercased.
+
+    Deliberately **not** applied:
+
+    * **No dot-stripping or provider-specific rules.** ``a.b@gmail.com`` and
+      ``ab@gmail.com`` are the same mailbox at Google, but "remove dots" is wrong
+      for most other providers, and guessing per-domain means two people can end
+      up sharing one account. Merging distinct addresses is worse than storing a
+      redundant one.
+    * **No Unicode case-folding beyond ``str.lower()``.** ``casefold()`` would map
+      ``ß`` to ``ss`` and ﬁ to fi, again merging addresses that are not the same.
+      Internationalised addresses are lowercased by ``lower()`` and left alone
+      otherwise.
+    * **No internal-whitespace removal and no syntax validation.** A space inside
+      an address is a malformed address, and silently repairing it would hide a
+      client bug. Rejecting it is :mod:`arb_core.validation`'s job (Pydantic
+      ``EmailStr``), not this function's.
+
+    The ``users.email`` column carries a ``CHECK (email = lower(email))``
+    constraint, so a row that bypassed this function cannot be written at all:
+    the unique index cannot be defeated by casing.
+    """
+    return _require_text(value).strip().lower()
+
+
+def _require_text(value: object) -> str:
+    """Return ``value`` when it is text, and raise otherwise.
+
+    The parameter is typed ``object`` so that the runtime guard is reachable:
+    ``normalize_email`` is annotated ``str``, and mypy would (correctly) report an
+    ``isinstance`` check on an already-``str`` value as dead code. Emails reach this
+    function from request bodies and administrative tooling, where a ``None`` or a
+    ``bytes`` is a real possibility and must be a clear ``TypeError`` rather than an
+    ``AttributeError`` from ``.strip()``.
+    """
+    if not isinstance(value, str):
+        msg = "email must be a str"
+        raise TypeError(msg)
+    return value

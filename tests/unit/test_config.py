@@ -10,6 +10,8 @@ than discovering it one restart at a time.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
@@ -18,6 +20,7 @@ from arb_core.config import (
     KNOWN_INSECURE_SECRETS,
     Environment,
     LogFormat,
+    PasswordHashScheme,
     Settings,
     find_project_root,
     get_settings,
@@ -205,6 +208,91 @@ class TestCrossFieldValidation:
                 worker_stale_after_seconds=30,
             )
 
+    def test_jwt_and_session_secrets_must_differ(self) -> None:
+        """Distinct purposes need distinct keys (§60, §61).
+
+        One secret used for both token signing and CSRF/session material means a
+        forgery primitive or a leak in either scheme immediately undermines the
+        other. Applies in every environment, not just production: a development
+        instance pointed at a shared database is still issuing real tokens.
+        """
+        shared = "x" * 64
+        with pytest.raises(ConfigurationError, match="must be different values"):
+            Settings(
+                environment=Environment.TEST,
+                jwt_secret=shared,
+                session_secret=shared,
+            )
+
+    def test_access_token_must_not_outlive_its_session(self) -> None:
+        """Otherwise revoking the session cannot revoke tokens already issued."""
+        with pytest.raises(ConfigurationError, match="shorter than the effective session"):
+            Settings(
+                environment=Environment.TEST,
+                access_token_ttl_minutes=1440,
+                session_ttl_hours=12,
+            )
+
+    def test_session_absolute_ttl_takes_the_stricter_bound(self) -> None:
+        """``SESSION_TTL_HOURS`` and ``REFRESH_TOKEN_TTL_DAYS`` describe one credential.
+
+        Neither may silently extend the other, so the effective lifetime is the
+        minimum. With the defaults that is 12 hours; an operator wanting 30-day
+        sessions raises ``SESSION_TTL_HOURS`` to its 720-hour maximum.
+        """
+        assert make_production().session_absolute_ttl == timedelta(hours=12)
+        long_sessions = make_production(session_ttl_hours=720, refresh_token_ttl_days=30)
+        assert long_sessions.session_absolute_ttl == timedelta(days=30)
+        capped_by_refresh = make_production(session_ttl_hours=720, refresh_token_ttl_days=1)
+        assert capped_by_refresh.session_absolute_ttl == timedelta(days=1)
+
+    def test_bcrypt_rejects_a_password_longer_than_it_can_hash(self) -> None:
+        """bcrypt discards every byte past the 72nd without error.
+
+        Accepting longer passwords would let two distinct passwords sharing a
+        72-byte prefix authenticate as the same account, so the combination is
+        refused at configuration time instead of being clamped at runtime.
+        """
+        with pytest.raises(ConfigurationError, match="PASSWORD_MAX_LENGTH"):
+            Settings(
+                environment=Environment.TEST,
+                password_hash_scheme=PasswordHashScheme.BCRYPT,
+                password_max_length=128,
+            )
+
+    def test_bcrypt_accepts_a_max_length_it_can_hash(self) -> None:
+        parsed = Settings(
+            environment=Environment.TEST,
+            password_hash_scheme=PasswordHashScheme.BCRYPT,
+            password_max_length=72,
+        )
+        assert parsed.password_hash_scheme is PasswordHashScheme.BCRYPT
+
+    def test_cross_field_problems_are_also_reported_together(self) -> None:
+        """Collection is not limited to the production checklist.
+
+        Before this was collected, the first cross-field failure raised and hid
+        every other problem — including production ones — behind it.
+        """
+        with pytest.raises(ConfigurationError) as excinfo:
+            Settings(
+                environment=Environment.TEST,
+                cookie_samesite="none",
+                cookie_secure=False,
+                jwt_secret="same",
+                session_secret="same",
+                cors_origins="*",
+            )
+        message = str(excinfo.value)
+        # Four, not three: a wildcard origin is both refused outright *and*
+        # reported as an invalid http(s) origin, because the two checks are
+        # independent and an operator should see both.
+        assert "4 configuration problem(s)" in message
+        assert "COOKIE_SAMESITE=none requires COOKIE_SECURE=true" in message
+        assert "must be different values" in message
+        assert "may not be '*'" in message
+        assert "is not a valid http(s) origin" in message
+
     def test_unsafe_jwt_algorithm_is_rejected(self) -> None:
         """``alg=none`` and friends must not be configurable (§136)."""
         for algorithm in ("none", "None", "HS1", "MD5"):
@@ -326,7 +414,14 @@ class TestProductionFailClosed:
         assert parsed.live_trading_enabled is True
 
     def test_all_problems_are_reported_at_once(self) -> None:
-        """An operator should not have to restart once per misconfiguration."""
+        """An operator should not have to restart once per misconfiguration.
+
+        ``jwt_secret`` and ``session_secret`` are both "short" here, so they are
+        also *equal* — which is its own problem (key separation, §60/§61) and is
+        reported alongside the length complaints rather than instead of them.
+        That is the property under test: every problem in one pass, cross-field
+        invariants included.
+        """
         with pytest.raises(ConfigurationError) as excinfo:
             make_production(
                 debug=True,
@@ -342,7 +437,8 @@ class TestProductionFailClosed:
         assert "RATE_LIMIT_ENABLED must be true" in message
         assert "JWT_SECRET" in message
         assert "SESSION_SECRET" in message
-        assert "6 configuration problem(s)" in message
+        assert "JWT_SECRET and SESSION_SECRET must be different values" in message
+        assert "7 configuration problem(s)" in message
 
     def test_error_message_contains_no_secret_values(self) -> None:
         secret = "a-very-specific-secret-value-that-must-not-appear"
