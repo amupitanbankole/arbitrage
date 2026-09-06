@@ -32,6 +32,8 @@ __all__ = [
     "LoginOutcome",
     "LoginResult",
     "MfaEnrollment",
+    "PasswordChangeResult",
+    "RegistrationResult",
 ]
 
 #: The HTTP authentication scheme, per RFC 6750. A literal rather than a module
@@ -97,6 +99,47 @@ class LoginResult:
         # The user's email is identity rather than a credential, and support staff
         # need it to tell results apart; no token is included.
         return f"LoginResult(outcome={self.outcome.value}, user_id={self.user.id})"
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationResult:
+    """What signing up produced.
+
+    ``verification_token`` is the plaintext of an emailed token, and is ``None`` when
+    the platform does not require address confirmation. Whether it is ever delivered
+    is the HTTP layer's decision and depends on configuration: a production response
+    body must not contain it, because an endpoint that returns a verification token to
+    whoever asked for one has verified nothing (§59).
+    """
+
+    user: User
+    verification_token: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"RegistrationResult(user_id={self.user.id}, "
+            f"verification_token={'<redacted>' if self.verification_token else None})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordChangeResult:
+    """What changing a password did.
+
+    Carries a fresh credential set, which is the part that is easy to get wrong. The
+    session that changed the password was necessarily created *before* the change, and
+    every pre-change session is refused from then on — so without a replacement the
+    caller would be signed out by their own successful request, and "sign out
+    everywhere else" would be unusable as a self-defence tool.
+
+    Re-issuing rather than exempting is also the stronger choice: the device that made
+    the change gets a new session family and a new refresh token, so a token copied
+    from that device earlier is dead too. An exemption would have left the one session
+    an attacker was most likely to be holding as the only surviving one.
+    """
+
+    revoked_sessions: int
+    tokens: IssuedTokens
 
 
 @dataclass(frozen=True, slots=True)

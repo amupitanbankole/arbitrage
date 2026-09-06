@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Final
 from arb_api.services.audit_service import AuditActor, AuditService
 from arb_api.services.auth_results import AuthenticatedRequest, IssuedTokens
 from arb_core.clock import utc_now
-from arb_core.errors import SessionRevokedError, TokenExpiredError
+from arb_core.errors import CsrfError, SessionRevokedError, TokenExpiredError
 from arb_core.log import get_logger
 from arb_core.security.csrf import CsrfProtector
 from arb_core.security.ratelimit import REFRESH_BY_IP
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from arb_core.config import Settings
+    from arb_core.db.session import Database
     from arb_core.security.ratelimit import RateLimiter
     from arb_core.security.tokens import TokenClaims
     from arb_persistence.models.auth import User, UserSession
@@ -83,12 +84,16 @@ class SessionService:
         session: AsyncSession,
         settings: Settings,
         rate_limiter: RateLimiter | None = None,
+        database: Database | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._sessions = SessionRepository(session)
         self._users = UserRepository(session)
-        self._audit = AuditService(session)
+        # `database` lets a rejection be audited in a transaction of its own:
+        # the refusal raises, this request's transaction rolls back, and an entry
+        # written into it would vanish with the very event it describes.
+        self._audit = AuditService(session, database=database)
         self._tokens = TokenService.from_settings(settings)
         self._csrf = CsrfProtector.from_settings(settings)
         self._rate_limiter = rate_limiter
@@ -140,6 +145,7 @@ class SessionService:
         self,
         *,
         refresh_token: str,
+        csrf_token: str | None,
         moment: datetime | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
@@ -151,11 +157,39 @@ class SessionService:
         whether the token was stolen, revoked or merely old. The difference between
         those cases is exactly what an attacker would probe for, so it stays in the
         audit log and out of the response.
+
+        ``csrf_token`` is required on every call, not only when the refresh token
+        arrived as a cookie. The cookie case is the obvious one — a browser attaches
+        it to any cross-site request — but a token in the body is not safe either:
+        FastAPI parses a request body as JSON without insisting on an
+        ``application/json`` content type, and a cross-site form can post
+        ``text/plain`` without provoking a CORS preflight. One unconditional rule
+        beats two conditions that have to be right in both places.
+
+        Verification happens against the session the token *resolved to*, before any
+        state changes. That ordering matters: a forged request must not be able to
+        reach the replay branch, because reaching it would revoke the victim's whole
+        session family — turning a CSRF hole into a denial of service.
         """
         now = moment if moment is not None else utc_now()
         await self._charge_refresh_budget(ip_address, now=now)
 
-        row = await self._sessions.get_by_refresh_token(hash_opaque_token(refresh_token))
+        # The plaintext, not a digest: the repository hashes on lookup so that the
+        # comparison cannot be done differently in two places. Hashing here as well
+        # produces a digest of a digest, which matches nothing and reads exactly like
+        # an unknown token - so a valid session is refused with no error anywhere.
+        row = await self._sessions.get_by_refresh_token(refresh_token)
+        if row is not None and not self._csrf.verify(csrf_token, session_id=row.id):
+            await self._audit_rejection(
+                reason="the CSRF token did not match the session being refreshed",
+                resource_id=row.id,
+                user_id=row.user_id,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                request_id=request_id,
+            )
+            raise CsrfError
+
         if row is None:
             await self._audit_rejection(
                 reason="unknown refresh token",
@@ -181,7 +215,7 @@ class SessionService:
                     "ip_address": ip_address or "unknown",
                 },
             )
-            await self._audit.record(
+            await self._audit.record_failure(
                 action="AUTH_SESSION_REFRESH_TOKEN_REPLAY",
                 resource_type="user_session",
                 resource_id=row.id,
@@ -193,7 +227,6 @@ class SessionService:
                 ),
                 new_value={"family_id": str(row.family_id), "sessions_revoked": revoked},
                 reason="a rotated refresh token was presented again",
-                result=AuditResult.FAILURE,
                 request_id=request_id,
             )
             raise SessionRevokedError
@@ -317,6 +350,48 @@ class SessionService:
             request_id=request_id,
         )
         return True
+
+    async def revoke_own(
+        self,
+        *,
+        session_id: UUID,
+        user: User,
+        reason: str,
+        moment: datetime | None = None,
+        ip_address: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """End one of *this account's* sessions.
+
+        Ownership is checked here rather than left to the caller, because an endpoint
+        that takes a session id in its path is an endpoint somebody will eventually
+        point at another person's id. ``False`` covers "no such session" and "not
+        yours" alike: telling those apart would confirm that a guessed id belongs to
+        somebody, which is the only useful thing an attacker could learn from it.
+        """
+        now = moment if moment is not None else utc_now()
+        row = await self._sessions.get_by_id(session_id)
+        if row is None or row.user_id != user.id:
+            await self._audit_rejection(
+                reason="a session id was presented that does not belong to the caller",
+                resource_id=session_id,
+                user_id=user.id,
+                ip_address=ip_address,
+                request_id=request_id,
+            )
+            return False
+        return await self.revoke(
+            session_id=session_id,
+            reason=reason,
+            moment=now,
+            actor=AuditActor(
+                actor_type=ActorType.USER,
+                actor_id=user.id,
+                role=user.role.value,
+                ip_address=ip_address,
+            ),
+            request_id=request_id,
+        )
 
     async def revoke_all(
         self,
@@ -481,7 +556,7 @@ class SessionService:
         request_id: str | None = None,
     ) -> None:
         """Record a rejection. No credential and no token ever reaches the entry."""
-        await self._audit.record(
+        await self._audit.record_failure(
             action="AUTH_SESSION_REJECTED",
             resource_type="user_session" if resource_id is not None else "auth",
             resource_id=resource_id,
@@ -492,6 +567,5 @@ class SessionService:
                 user_agent=user_agent,
             ),
             reason=reason,
-            result=AuditResult.FAILURE,
             request_id=request_id,
         )

@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from arb_core.db.session import Database
+
 __all__ = ["AuditActor", "AuditService"]
 
 _logger = get_logger(__name__)
@@ -63,9 +65,13 @@ class AuditActor:
 class AuditService:
     """Writes append-only audit entries."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, database: Database | None = None) -> None:
         self._session = session
         self._repository = AuditRepository(session)
+        #: Needed only by :meth:`record_failure`, which has to write outside the
+        #: request's transaction. ``None`` means "no independent handle available",
+        #: and that case degrades to a log line rather than to an exception.
+        self._database = database
 
     async def record(
         self,
@@ -129,6 +135,61 @@ class AuditService:
             },
         )
         return entry
+
+    async def record_failure(
+        self,
+        *,
+        action: str,
+        resource_type: str,
+        resource_id: str | UUID | int | None = None,
+        actor: AuditActor | None = None,
+        old_value: dict[str, Any] | None = None,
+        new_value: dict[str, Any] | None = None,
+        reason: str | None = None,
+        result: AuditResult = AuditResult.FAILURE,
+        request_id: str | None = None,
+    ) -> AuditLog | None:
+        """Record a FAILURE or DENIED outcome in a transaction of its own.
+
+        A rejection raises, and the request's transaction rolls back with it. An
+        entry written into that transaction therefore disappears — so the record of a
+        failed sign-in, a refused permission, a replayed refresh token or a redeemed
+        reset token, which is precisely the record §52, §53 and §62 exist to keep, is
+        the one that would be silently lost. Successes stay in the caller's
+        transaction, where they *should* share its fate: an audit entry claiming a
+        password was changed must not outlive the change being rolled back.
+
+        Returns ``None`` when no :class:`~arb_core.db.session.Database` handle was
+        supplied, rather than raising. Losing a line of the security record is bad;
+        turning an in-flight refusal into a 500 — and so telling the refused caller
+        that something went wrong server-side — is worse, and the refusal is still
+        written to the application log.
+        """
+        if result is AuditResult.SUCCESS:
+            msg = "record_failure is for FAILURE and DENIED outcomes; use record() for a success"
+            raise ValueError(msg)
+        if self._database is None:
+            _logger.warning(
+                "audit failure entry dropped; no independent database handle",
+                extra={"audit_action": action, "audit_result": result.value},
+            )
+            return None
+
+        async with self._database.unit_of_work() as own_session:
+            # A fresh service over the fresh session: the outer repository is bound
+            # to a session whose transaction is about to be rolled back, and reusing
+            # it would attach the entry to exactly the transaction we are escaping.
+            return await AuditService(own_session).record(
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                actor=actor,
+                old_value=old_value,
+                new_value=new_value,
+                reason=reason,
+                result=result,
+                request_id=request_id,
+            )
 
     async def record_denied(
         self,
