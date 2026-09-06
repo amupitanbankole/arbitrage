@@ -228,6 +228,19 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
             return True
         return False
 
+    def clear_failed_logins(self) -> None:
+        """Forget the failure counters once the password has been proved.
+
+        Deliberately narrower than :meth:`record_successful_login`. An account with a
+        second factor has proved one of two things at this point, and the counters
+        track *password guessing* — which has stopped — while ``last_login_at`` must
+        not claim a sign-in that has not finished yet. Stamping it here would show a
+        successful login for every account whose MFA step was then abandoned, and
+        "logins per hour" would quietly become "passwords guessed correctly per hour".
+        """
+        self.failed_login_count = 0
+        self.locked_until = None
+
     def record_successful_login(self, *, moment: datetime) -> None:
         """Clear the failure counters after a verified sign-in (§61)."""
         self.failed_login_count = 0
@@ -268,11 +281,35 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin):
             raise ValueError(msg)
         self.totp_confirmed_at = moment
         self.mfa_enabled = True
+        # Enrollment clears any step recorded against a previous secret, so the
+        # first code entered on a freshly confirmed secret cannot be mistaken for a
+        # replay of one accepted under the old secret.
+        self.totp_last_used_step = None
+
+    def totp_step_is_replay(self, step: int) -> bool:
+        """Whether ``step`` has already been accepted for this account.
+
+        RFC 6238 §5.2: "The verifier MUST NOT accept the second attempt of the OTP
+        after the successful validation." Without this check, the drift window that
+        tolerates a phone with a skewed clock is also a window in which a code seen
+        once — over a shoulder, or typed into a phishing page — can be presented
+        again, three times over at the default drift of one step either side.
+
+        ``<=`` rather than ``==``: a step *older* than the newest accepted one must
+        also be refused, or an attacker who recorded two codes could spend the older
+        one after the newer one had been used.
+        """
+        return self.totp_last_used_step is not None and step <= self.totp_last_used_step
+
+    def record_totp_step(self, step: int) -> None:
+        """Remember the most recently accepted step so it cannot be reused."""
+        self.totp_last_used_step = step
 
     def disable_mfa(self) -> None:
         """Remove the second factor entirely."""
         self.totp_secret_encrypted = None
         self.totp_confirmed_at = None
+        self.totp_last_used_step = None
         self.mfa_enabled = False
 
     def safe_snapshot(self) -> dict[str, Any]:

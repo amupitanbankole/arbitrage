@@ -132,8 +132,17 @@ def production_settings() -> Settings:
 # ---------------------------------------------------------------------------
 @pytest.fixture
 async def database(settings: Settings) -> AsyncIterator[Database]:
-    """An in-memory SQLite database with the full schema created."""
-    db = Database.create(settings.database_url.get_secret_value(), echo=settings.database_echo)
+    """An in-memory SQLite database with the full schema created.
+
+    Built through ``from_settings`` rather than ``Database.create`` so the URL goes
+    through :func:`arb_core.db.session.build_engine_kwargs`, which gives in-memory
+    SQLite a ``StaticPool``. Without it every *connection* gets its own empty
+    database, which is invisible while a test uses one session and fatal the moment
+    anything opens a second one — and the audit trail for a rejected request does
+    exactly that, because it has to commit independently of the transaction the
+    rejection rolls back.
+    """
+    db = Database.from_settings(settings)
     async with db.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     try:
