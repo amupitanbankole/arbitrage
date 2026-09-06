@@ -5,13 +5,19 @@ automated opportunity detection across exchanges, paper and controlled live
 trading, a risk engine with hard limits and circuit breakers, portfolio and P&L
 reporting, backtesting, and an RBAC-gated admin platform.
 
-> **Current state: Phase 1 — Foundation.**
-> Nothing here can trade yet. There is no exchange integration, no order path,
-> no user account and no web UI. What exists is the substrate every later phase
-> is built on: configuration, structured logging with secret redaction, a
-> Decimal-only persistence layer under Alembic, Redis with a distributed lock,
-> health and metrics, a worker runtime with heartbeats, feature flags, an
-> append-only audit log, and the HTTP error/security envelope.
+> **Current state: Phase 2 — Authentication, authorization & session management.**
+> Nothing here can trade yet. There is no exchange integration, no order path and
+> no web UI. What exists is the substrate every later phase is built on —
+> configuration, structured logging with secret redaction, a Decimal-only
+> persistence layer under Alembic, Redis with a distributed lock, health and
+> metrics, a worker runtime with heartbeats, feature flags, an append-only audit
+> log, the HTTP error/security envelope — plus, since Phase 2, real accounts:
+> argon2id passwords, server-side sessions with refresh-token rotation and reuse
+> detection, TOTP and single-use recovery codes, CSRF-protected cookie flows,
+> account lockout, seven-role RBAC enforced per request, and rate limits that fail
+> closed when Redis is unreachable. Nineteen endpoints under `/api/v1/auth`.
+> Email *delivery* does not exist yet, so verification and reset tokens are
+> returned to the caller on a development environment and labelled as such.
 >
 > **[`docs/STATUS.md`](docs/STATUS.md) is the authoritative capability list**,
 > labelling every requirement IMPLEMENTED / PARTIALLY IMPLEMENTED / MOCKED /
@@ -22,16 +28,26 @@ reporting, backtesting, and an RBAC-gated admin platform.
 ## Non-negotiable principles
 
 These are properties of the system, not aspirations. Each one is enforced in code
-and asserted by a test.
+and asserted by a test **where the code that would violate it exists yet** — three
+of them are marked below with the phase that makes them live, because a principle
+written down ahead of the subsystem it governs is a design constraint, not a
+guarantee, and calling it a guarantee would be exactly the kind of claim this
+repository does not make. [`docs/STATUS.md`](docs/STATUS.md) carries the current
+enforcement status of everything.
 
 1. **Non-custodial.** The platform never holds user funds, never requests
    withdrawal permission, and never initiates a withdrawal. Exchange keys are
    trade-and-read scoped, encrypted at rest, and the encryption envelope is bound
-   to a tenant context so a ciphertext cannot be replayed elsewhere.
+   to a tenant context so a ciphertext cannot be replayed elsewhere. *The
+   envelope, the validation and the tenant binding exist and are tested; the keys
+   themselves arrive in Phase 3, and no withdrawal has ever been possible because
+   no order path exists.*
 2. **No live order without explicit activation.** Live trading is off by
    default and gated by three independent switches — a global configuration flag,
    a database feature flag, and a per-bot activation that is permission-gated and
-   audited. Killing any one of them stops everything.
+   audited. Killing any one of them stops everything. *The first two switches are
+   implemented, validated and surfaced read-only; per-bot activation arrives with
+   live trading in Phase 11. There is no order path to activate today.*
 3. **Money is `Decimal`, everywhere.** `float` is rejected at the conversion
    boundary (`arb_core.money.to_decimal`) rather than rounded later. Storage uses
    `NUMERIC(38,18)`; NaN and Infinity are refused on write.
@@ -45,7 +61,9 @@ and asserted by a test.
 8. **Secrets are never logged, never returned, never committed.** Redaction is on
    by default and cannot be disabled in a deployed environment.
 9. **Trading operations are idempotent.** A retried request must not produce a
-   second order.
+   second order. *Phase 11. The pattern is already in use where it matters today:
+   refresh-token rotation and one-time auth tokens are single-use by construction,
+   and `IDEMPOTENCY_CONFLICT` is defined in the error taxonomy.*
 10. **Honest labelling.** No fake integrations, no simulated exchange described
     as a real one, no claim of execution without an exchange confirmation.
 
@@ -66,6 +84,40 @@ Then: <http://localhost/> for service identity, <http://localhost/health> for
 dependency health. OpenAPI docs and `/metrics` are served by the API on
 `127.0.0.1:8000` and deliberately refused with 404 at nginx.
 
+Sign up and sign in against a development stack — `EMAIL_PROVIDER=none` returns
+the verification token in the response, because no email sender exists yet:
+
+```bash
+curl -sX POST localhost:8000/api/v1/auth/register \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","password":"correct-horse-battery-42","display_name":"You"}'
+# 201 -> {"user":{"role":"TRADER","status":"PENDING_VERIFICATION",...},
+#         "requires_email_verification":true,"message":"...","dev_verification_token":"ev_..."}
+
+curl -sX POST localhost:8000/api/v1/auth/email/verify \
+  -H 'content-type: application/json' -d '{"token":"ev_..."}'
+# 200 -> {"message":"Email address confirmed. You can sign in now.","code":null}
+
+curl -siX POST localhost:8000/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","password":"correct-horse-battery-42"}'
+# 200 -> {"user":{...},"tokens":{"access_token":"...","refresh_token":"rt_...",
+#         "csrf_token":"...","token_type":"bearer","expires_in":900,"session_id":"..."}}
+# Set-Cookie: arb_refresh=rt_...; HttpOnly; Path=/api/v1/auth; SameSite=lax
+# Set-Cookie: arb_csrf=...;             Path=/api/v1/auth; SameSite=lax
+```
+
+`dev_verification_token` (and `dev_reset_token`) appear only when
+`EMAIL_PROVIDER=none` on an environment that is neither staging nor production; on a
+deployed stack they are `null`, because nothing sends the email yet. Both cookies are
+path-scoped to `/api/v1/auth`, and only the refresh one is `HttpOnly` — the CSRF
+cookie has to be readable for a double-submit check to work at all.
+`POST /api/v1/auth/refresh` requires that CSRF token echoed in the `X-CSRF-Token`
+header **even when the refresh token is sent in the body**: a cross-site form can post
+JSON under `text/plain` without provoking a CORS preflight, so a token arriving in the
+body is not proof of same-origin intent. Every endpoint is listed in
+[`docs/STATUS.md`](docs/STATUS.md#api-surface).
+
 Without Docker, the Python services still run against a local PostgreSQL and
 Redis:
 
@@ -81,12 +133,15 @@ uv run arb-worker foundation
 
 ```
 apps/
-  api/        arb_api        FastAPI: versioned REST, health, metrics, middleware
+  api/        arb_api        FastAPI: versioned REST, health, metrics, middleware,
+                             authentication endpoints, services and dependencies
   worker/     arb_worker     Role-based background processes with heartbeats
   web/        —              Next.js frontend (Phase 8; currently empty)
 packages/
   core/       arb_core       Configuration, logging, errors, money, clock, identity,
-                             database, Redis + locks, health, metrics, events, worker
+                             database, Redis + locks, health, metrics, events, worker,
+                             and the security primitives: password hashing and policy,
+                             TOTP, tokens, AES-GCM envelope, CSRF, rate limiting, RBAC
   persistence/arb_persistence ORM models, repositories, Alembic migrations
 infrastructure/
   docker/     Dockerfile, docker-compose.yml, nginx/, prometheus/, grafana/
@@ -123,7 +178,7 @@ a restart policy whether retrying could ever help.
 | `make check` | The CI gate: `ruff check`, `ruff format --check`, `mypy` strict, `pytest`. |
 | `make lint` / `make format` | Lint, and rewrite. |
 | `make typecheck` | mypy strict over `packages/`, `apps/`, `tests/`. |
-| `make test` | Full suite (1051 tests). |
+| `make test` | Full suite (1710 tests). |
 | `make migration m="…"` | Autogenerate an Alembic revision. |
 | `make migrate` | `alembic upgrade head`. |
 | `make doctor` | Toolchain versions and docker availability. |
@@ -143,17 +198,21 @@ runs; the production image and CI use 3.12, and CI runs the suite on both.
 ## Testing
 
 ```
-tests/unit          336   isolated: money, clock, config, errors, events, logging,
-                          pagination, redaction, identifiers
-tests/integration   666   database, migrations, health, system endpoints, Redis
+tests/unit          856   isolated: money, clock, config, errors, events, logging,
+                          pagination, redaction, identifiers, passwords, TOTP,
+                          tokens, CSRF, rate limiting, RBAC
+tests/integration   808   database, migrations, health, system endpoints, Redis
                           locks, feature flags, audit, worker runtime and CLI,
-                          metrics endpoint (+2 PostgreSQL-gated)
+                          metrics endpoint, the 59-test authentication suite
+                          driving the real ASGI application, and 8 tests holding
+                          docs/STATUS.md to the routes and error codes it
+                          documents (+3 PostgreSQL-gated)
 tests/security       49   endpoint invariants: error-envelope safety, universal
-                          security headers, metrics access control, CORS, absence
-                          of mutating routes
+                          security headers, metrics access control, CORS, and that
+                          the Phase 1 observability surface exposes no write path
 ```
 
-The two gated tests are the PostgreSQL-backed database and migration suites.
+The three gated tests are the PostgreSQL-backed database and migration suites.
 They skip locally without `TEST_POSTGRES_URL` and **run in CI**, which provides
 real `postgres:16` and `redis:7` service containers — and CI fails if it sees
 their skip reason, so they cannot quietly stop running.
@@ -172,7 +231,7 @@ typecheck and a status report before the next begins.
 | # | Phase | Status |
 | --- | --- | --- |
 | 1 | Foundation | **Complete** — see `docs/STATUS.md` |
-| 2 | Authentication, users, sessions, RBAC | Not started |
+| 2 | Authentication, users, sessions, RBAC | **Complete** — see `docs/STATUS.md` |
 | 3 | Exchange integrations (read-only) | Not started |
 | 4 | Market data & order books | Not started |
 | 5 | Arbitrage detection | Not started |

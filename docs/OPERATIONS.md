@@ -1,9 +1,9 @@
 # Operations
 
-**Phase 1 — Foundation.** This document describes how to run, migrate, observe
-and maintain what exists today. It does not describe trading operations, because
-nothing in this repository can trade yet: see [`STATUS.md`](./STATUS.md) for the
-authoritative capability list.
+**Phase 2 — Authentication, authorization & session management.** This document
+describes how to run, migrate, observe and maintain what exists today. It does not
+describe trading operations, because nothing in this repository can trade yet: see
+[`STATUS.md`](./STATUS.md) for the authoritative capability list.
 
 Everything here assumes the repository root as the working directory and `uv`
 installed. Every routine action has a `make` target; the raw commands are shown
@@ -77,11 +77,60 @@ service's `environment:` block.
 
 ### Rotating `ENCRYPTION_KEY`
 
-Phase 1 validates the key but does not yet encrypt anything, so rotation is
-currently free. From Phase 3 onward every stored exchange credential is
-encrypted under it, and rotating requires re-encrypting existing rows — a
-deliberate, tested migration, not an environment-variable change. Do not rotate
-it in a deployed environment after Phase 3 without that procedure.
+**No longer free.** Phase 2 stores `users.totp_secret_encrypted` as AES-256-GCM
+ciphertext under this key, with the additional authenticated data `totp_secret`.
+Changing the key without re-encrypting those rows leaves every enrolled
+authenticator unverifiable: decryption fails, MFA verification fails, and the
+accounts affected lose the second factor they were told to rely on.
+
+Two ways to rotate, in order of preference:
+
+1. **Re-encrypt in place.** Read each row, decrypt under the old key, encrypt
+   under the new one, write back — in a transaction, with both keys available to
+   the process for the duration. This is a script, not an environment-variable
+   change, and it must be rehearsed against a copy of production first.
+2. **Force re-enrolment.** Clear `totp_secret_encrypted`, `totp_confirmed_at` and
+   `totp_last_used_step`, set `mfa_enabled = false`, and delete the account's
+   `mfa_recovery_codes` rows. Simpler and harder to get wrong, visibly disruptive,
+   and the only option when the old key is lost rather than merely compromised.
+
+From Phase 3 onward every stored exchange credential is encrypted under the same
+key, which turns rotation from a maintenance task into a project. Do not rotate it
+in a deployed environment without a written, rehearsed procedure.
+
+### Rotating `JWT_SECRET` and `SESSION_SECRET`
+
+Both are safe to rotate, and both are disruptive in a specific, predictable way:
+
+* **`JWT_SECRET`** signs access tokens. Rotating it invalidates every outstanding
+  token at once — each fails signature verification — and clients recover on their
+  next refresh, which needs no JWT secret. Expect a burst of 401s lasting up to
+  `ACCESS_TOKEN_TTL_MINUTES` (15 by default) and no data loss.
+* **`SESSION_SECRET`** signs CSRF tokens. Rotating it invalidates every CSRF
+  cookie, and because `/refresh` requires a valid CSRF token, **every session
+  becomes unrefreshable**: users are signed out when their access token expires
+  and must sign in again. Nothing is corrupted; the server-side sessions stay
+  valid and are simply not reachable without a fresh login.
+
+Rotating either is a "schedule it, tell users, expect re-authentication" operation,
+not a rolling-restart detail. Changing `JWT_ISSUER` or `JWT_AUDIENCE` has the same
+effect with none of the benefit, which is also how a rotation can be forced without
+changing a secret.
+
+### When Redis is unreachable, sign-ins are refused
+
+Every authentication rate-limit scope **fails closed**: with Redis down, `POST
+/login`, `/register`, `/refresh`, `/mfa/login` and `/password/reset` are refused
+rather than allowed unlimited attempts, and the refusal is logged at ERROR with the
+driver's exception type. This is deliberate — a limiter that fails open during an
+outage is a limiter that is off exactly when somebody is probing — but it means **a
+Redis outage presents as "nobody can sign in"**, not as a cache problem. Access
+tokens already issued keep working until they expire, because authentication reads
+PostgreSQL rather than Redis. Restore Redis; do not relax the limiter.
+
+`API_PER_USER` (600 requests/minute) is the exception: it fails **open**, loudly,
+reporting `enforced=False`, because refusing all read traffic when a cache is down
+trades an availability problem for a larger one.
 
 ---
 
@@ -116,6 +165,14 @@ Rules that are enforced rather than merely recommended:
   apply part of a revision.
 * CI runs `upgrade → downgrade → upgrade` against a real PostgreSQL, and fails
   if the PostgreSQL-marked tests were skipped.
+* DDL that PostgreSQL alone supports is guarded by `_is_postgresql()` — see
+  `0003_totp_replay_guard`, which adds a CHECK constraint to an existing table.
+  The same revision must run against PostgreSQL in CI and against SQLite in the
+  local suite, and SQLite has no `ALTER TABLE … ADD CONSTRAINT`. Alembic's batch
+  copy-and-move mode is deliberately **not** used instead: it cannot run in
+  offline `--sql` mode without a live connection to reflect the table, and
+  passing `copy_from` means restating every column of the table inside the
+  revision, where an omitted column is one the copy silently drops.
 
 **Review every autogenerated revision.** Autogenerate cannot see a semantic
 change: it will not add a trigger, will not notice that a column needs a
@@ -421,6 +478,90 @@ worker jobs, and kill-switch events. Anonymous access and sign-up are disabled.
 * **`make down` does not delete volumes.** Data survives a redeploy;
   `docker compose … down -v` is how you destroy it, and that is never in a
   Makefile target.
+* **No credential is stored in a usable form.** Passwords are argon2id digests;
+  refresh tokens, one-time tokens and recovery codes are stored only as SHA-256
+  digests; the TOTP secret is AES-256-GCM ciphertext. A database dump is not a
+  credential dump — and rotating `ENCRYPTION_KEY` is the one operation that turns
+  those ciphertexts into a maintenance problem (§3).
+* **`X-Forwarded-For` is believed only when `TRUST_PROXY_HEADERS=true` and the
+  direct peer is listed in `FORWARDED_ALLOW_IPS`.** Behind nginx both must be set
+  or every request is attributed to the proxy, which empties the per-IP rate
+  limits and makes the audit log name nobody. Never set `FORWARDED_ALLOW_IPS=*` in
+  a deployed environment: with `*`, any client chooses the address it is
+  rate-limited and audited under.
+
+### Account operations
+
+The interventions an operator needs and, in Phase 2, must make by hand — there is
+no administrative API yet (Phase 9). Each is a single statement against
+PostgreSQL. None of them is recorded in `audit_logs`, because the platform only
+audits actions it takes itself; write the intervention down wherever your incident
+record lives.
+
+* **Unlock an account** locked by five wrong passwords (fifteen minutes by
+  default):
+
+  ```sql
+  UPDATE users SET failed_login_count = 0, locked_until = NULL,
+                   last_failed_login_at = NULL
+   WHERE email = lower('User@Example.com');
+  ```
+
+  `email` is stored lower-cased — a CHECK constraint enforces `email =
+  lower(email)` — so lower-casing the *literal* rather than the column keeps the
+  unique index usable.
+
+  Read the `USER_LOGIN` failures in `audit_logs` first. If they all came from one
+  address, the lock did its job and unlocking only invites the next round; if they
+  came from the user's own address, they have forgotten their password and need a
+  reset instead.
+* **Sign a user out everywhere** (suspected compromise). The user can do this
+  themselves with `POST /api/v1/auth/logout-all`; from the server side:
+
+  ```sql
+  UPDATE user_sessions
+     SET status = 'REVOKED', revoked_at = now(), revoke_reason = 'ADMIN_REVOKED'
+   WHERE user_id = '<uuid>' AND status = 'ACTIVE';
+  ```
+
+  `revoke_reason` is free text up to 64 characters. The application's own
+  vocabulary is `USER_LOGOUT`, `USER_LOGOUT_ALL`, `PASSWORD_CHANGED`,
+  `PASSWORD_RESET`, `TOKEN_REUSE` and `USER_INACTIVE`; use a distinct value for a
+  hand-made revocation so the two are separable later. Access tokens stop working
+  on the *next* request, because authentication re-reads the session row instead of
+  trusting the token.
+* **Force a password change at the next sign-in**: set `users.must_change_password =
+  true`. `GET /api/v1/auth/me` returns it and a client is expected to route
+  straight to the change form. An administrator **cannot set a password** for a
+  user in this phase: there is no endpoint, and hand-writing an argon2id digest
+  into the column is not a supported path.
+* **Reset a user's MFA** when the phone is gone and the recovery codes are spent:
+
+  ```sql
+  UPDATE users SET totp_secret_encrypted = NULL, totp_confirmed_at = NULL,
+                   totp_last_used_step = NULL, mfa_enabled = false
+   WHERE id = '<uuid>';
+  DELETE FROM mfa_recovery_codes WHERE user_id = '<uuid>';
+  ```
+
+  They re-enrol at their next sign-in. Verify who is asking before running this: it
+  is exactly the action an account thief would request from support.
+* **Read what an account has been doing**:
+
+  ```sql
+  SELECT occurred_at, action, result, resource_type, ip_address, user_agent,
+         request_id
+    FROM audit_logs
+   WHERE actor_id = '<uuid>'
+   ORDER BY occurred_at DESC
+   LIMIT 200;
+  ```
+
+  Failures and denials are here too, and deliberately so: a refusal raises and
+  rolls back its own transaction, so `AuditService.record_failure()` writes in a
+  separate one. An audit log holding only successes would be a log of nothing
+  anybody tried. A run of `result = 'DENIED'` against administrative permissions
+  from an ordinary account is privilege-escalation probing until proved otherwise.
 
 ---
 
@@ -429,17 +570,21 @@ worker jobs, and kill-switch events. Anonymous access and sign-up are disabled.
 | Symptom | First thing to check |
 | --- | --- |
 | `api` restarts in a loop | `make logs`. A `ConfigurationError` on stderr means the environment is invalid, not that the database is down. |
+| Nobody can sign in but `/health/live` is 200 | Redis. Authentication rate limits fail **closed**, so an unreachable Redis refuses `/login`, `/refresh`, `/mfa/login` and `/password/reset` — look for `rate_limit.fail_closed` at ERROR (§3). Issued access tokens still work; authentication reads PostgreSQL. |
+| A user is signed out immediately after changing their password | Correct behaviour, and the response says so: `/password/change` revokes every session including the caller's and returns a replacement token set. A client that discards `tokens` from that response is signed out by design (`STATUS.md`, judgment call 1). |
+| `/refresh` returns `CSRF_FAILED` with a valid refresh token | The `X-CSRF-Token` header must carry the value of the `arb_csrf` cookie for the *same* session. It is required even when the token is in the body, and it is checked before anything is mutated. |
+| Refresh returns `SESSION_REVOKED` for a token that was just issued | Rotation is single-use: presenting a superseded token revokes the whole family, including the presenter's. Two clients sharing one session (or a retry after a timeout) look exactly like theft, and that is the point. |
 | `migrate` exits non-zero and nothing starts | By design — `api` and `worker` wait for `service_completed_successfully`. Read `docker compose … logs migrate`. |
 | `/health/ready` is 503 but `/health/live` is 200 | Correct behaviour. `/health` names the failing component and the exception *type*. |
 | Worker shows as stale | Compare `last_heartbeat_at` in the Redis hash against `WORKER_STALE_AFTER_SECONDS`. Terminal statuses are always stale regardless of age. |
 | `arb-worker` exits 2 | Role name typo, or `WORKER_ROLES` empty. `arb-worker --list-roles` shows what the build has — and works even when configuration is broken. |
-| Grafana panel is empty | Check whether the metric is in the "defined, not yet incremented" table above. In Phase 1 only the two API metrics have data. |
+| Grafana panel is empty | Check whether the metric is in the "defined, not yet incremented" table above. Only the two API metrics have data so far; authentication adds audit rows, not metrics. |
 | Prometheus target down | `METRICS_AUTH_TOKEN` must match between compose's `environment:` for prometheus and the api service. An empty token means no auth. |
 | nginx 502 | The API is not healthy. `make ps`, then `make api-logs`. |
 
 ---
 
-## 11. Known operational limitations (Phase 1)
+## 11. Known operational limitations
 
 * **The stack has never been started in the environment that produced it.** The
   sandbox has no Docker daemon. Compose, nginx, Prometheus and Grafana
@@ -450,8 +595,22 @@ worker jobs, and kill-switch events. Anonymous access and sign-up are disabled.
   is the first evidence.
 * **No alerting.** Prometheus records; nothing pages. Alert rules and
   Alertmanager are Phase 13.
-* **No application-level rate limiting.** Only nginx's coarse 10r/s zone. Per-user
-  and per-endpoint buckets (§76) arrive with authentication in Phase 2.
+* **No email delivery.** `EMAIL_PROVIDER=none` is the only working provider, so
+  address verification and password reset return their token to the caller on a
+  development environment and cannot complete at all on a deployed one. SMTP/SES
+  arrive with notifications in Phase 8+; until then a deployed stack can create
+  accounts nobody can verify.
+* **No administrative API.** Every account operation above is a hand-written
+  statement against PostgreSQL. User management, role assignment and a session
+  view for support staff are Phase 9.
+* **Rate limiting uses a fixed window.** Seven buckets are enforced atomically and
+  the authentication scopes fail closed, but a fixed window admits up to twice the
+  intended count across a boundary, and nothing coordinates with nginx's coarse
+  10r/s zone.
+* **No browser has exercised the cookie flow.** The endpoints are tested through
+  the real ASGI application; `SameSite` behaviour, third-party-cookie blocking and
+  redirect-after-login are browser decisions, unverified until Phase 8 ships a
+  frontend.
 * **Single-node.** One API replica, one worker, no queue, no leader election.
   The distributed lock is correct across processes and is exercised by tests, but
   nothing runs more than one worker yet.
