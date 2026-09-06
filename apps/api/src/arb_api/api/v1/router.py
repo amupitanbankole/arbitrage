@@ -21,7 +21,7 @@ from typing import Final
 from fastapi import APIRouter
 
 from arb_api.api.paths import API_V1_PREFIX
-from arb_api.api.v1 import system
+from arb_api.api.v1 import auth, system
 from arb_api.schemas.common import ApiIndex, ResourceGroup
 from arb_api.state import StateDep
 
@@ -29,6 +29,10 @@ __all__ = ["api_v1_router"]
 
 api_v1_router = APIRouter()
 
+# Auth first: it is the only group whose endpoints are reachable without a
+# credential, and reading the mount order top-down matches the order a client
+# has to use them.
+api_v1_router.include_router(auth.router)
 api_v1_router.include_router(system.router)
 
 #: Implemented label per §151.
@@ -41,7 +45,7 @@ _NOT_IMPLEMENTED: Final[str] = "NOT IMPLEMENTED"
 #: ``arb_api.services.health_service.INFORMATIONAL_COMPONENTS``.
 _RESOURCE_GROUPS: Final[tuple[ResourceGroup, ...]] = (
     ResourceGroup(name="system", path="/api/v1/system", status=_IMPLEMENTED, phase="Phase 1"),
-    ResourceGroup(name="auth", status=_NOT_IMPLEMENTED, phase="Phase 2"),
+    ResourceGroup(name="auth", path=f"{API_V1_PREFIX}/auth", status=_IMPLEMENTED, phase="Phase 2"),
     ResourceGroup(name="users", status=_NOT_IMPLEMENTED, phase="Phase 2"),
     ResourceGroup(name="exchanges", status=_NOT_IMPLEMENTED, phase="Phase 3"),
     ResourceGroup(name="markets", status=_NOT_IMPLEMENTED, phase="Phase 4"),

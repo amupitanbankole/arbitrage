@@ -240,6 +240,13 @@ filterwarnings = [
     "error",
     # Third-party deprecations we cannot control yet.
     "ignore::DeprecationWarning:fakeredis.*",
+    # Starlette 1.6 deprecated the HTTP_422_UNPROCESSABLE_ENTITY constant that
+    # FastAPI 0.141 still reads while building its validation-error response. The
+    # warning therefore fires from inside FastAPI's own handler, on the way to
+    # producing a perfectly correct 422, so without this every malformed request
+    # fails the suite for a reason that is upstream's to fix. Scoped to the exact
+    # message rather than to the warning class, so nothing else is silenced.
+    "ignore:'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated",
 ]
 markers = [
     "unit: fast, isolated tests with no external services",
